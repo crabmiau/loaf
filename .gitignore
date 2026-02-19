@@ -1,0 +1,35 @@
+# dependencies
+node_modules/
+
+# env / secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# build / coverage / caches
+dist/
+coverage/
+.cache/
+.eslintcache
+*.tsbuildinfo
+
+# runtime / logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+.loaf-state.json
+
+# local artifacts / generated assets
+artifacts/
+playwright-report/
+test-results/
+blob-report/
+
+# editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

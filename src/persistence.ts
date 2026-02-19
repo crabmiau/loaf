@@ -1,0 +1,264 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { type AuthProvider, type ThinkingLevel } from "./config.js";
+
+export type LoafPersistedState = {
+  version: 1;
+  authProviders?: AuthProvider[];
+  authProvider?: AuthProvider;
+  selectedModel?: string;
+  selectedThinking?: ThinkingLevel;
+  openRouterApiKey?: string;
+  exaApiKey?: string;
+  selectedOpenRouterProvider?: string;
+  onboardingCompleted?: boolean;
+  inputHistory?: string[];
+  updatedAt?: string;
+};
+
+const STATE_FILE_PATH = getStateFilePath();
+const LEGACY_STATE_FILE_PATH = path.resolve(process.cwd(), ".loaf-state.json");
+const MAX_HISTORY_ITEMS = 200;
+
+export function loadPersistedState(): LoafPersistedState | null {
+  const current = readStateFromPath(STATE_FILE_PATH);
+  if (current) {
+    return current;
+  }
+
+  const legacy = readStateFromPath(LEGACY_STATE_FILE_PATH);
+  if (!legacy) {
+    return null;
+  }
+
+  writeStateToPath(STATE_FILE_PATH, legacy);
+  try {
+    if (fs.existsSync(LEGACY_STATE_FILE_PATH)) {
+      fs.unlinkSync(LEGACY_STATE_FILE_PATH);
+    }
+  } catch {
+    // best-effort cleanup
+  }
+  return legacy;
+}
+
+export function savePersistedState(next: {
+  authProviders: AuthProvider[];
+  selectedModel: string;
+  selectedThinking: ThinkingLevel;
+  openRouterApiKey?: string;
+  exaApiKey?: string;
+  selectedOpenRouterProvider?: string;
+  onboardingCompleted: boolean;
+  inputHistory: string[];
+}): void {
+  const authProviders = dedupeAuthProviders(next.authProviders);
+  const primaryAuthProvider = authProviders[0];
+
+  const payload: LoafPersistedState = {
+    version: 1,
+    authProviders: authProviders.length > 0 ? authProviders : undefined,
+    authProvider: primaryAuthProvider,
+    selectedModel: next.selectedModel.trim(),
+    selectedThinking: next.selectedThinking,
+    openRouterApiKey:
+      typeof next.openRouterApiKey === "string" && next.openRouterApiKey.trim()
+        ? next.openRouterApiKey.trim()
+        : undefined,
+    exaApiKey:
+      typeof next.exaApiKey === "string" && next.exaApiKey.trim()
+        ? next.exaApiKey.trim()
+        : undefined,
+    selectedOpenRouterProvider:
+      typeof next.selectedOpenRouterProvider === "string" && next.selectedOpenRouterProvider.trim()
+        ? next.selectedOpenRouterProvider.trim()
+        : undefined,
+    onboardingCompleted: next.onboardingCompleted === true,
+    inputHistory: next.inputHistory
+      .filter((item) => typeof item === "string")
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .slice(-MAX_HISTORY_ITEMS),
+    updatedAt: new Date().toISOString(),
+  };
+
+  writeStateToPath(STATE_FILE_PATH, payload);
+}
+
+function readStateFromPath(stateFilePath: string): LoafPersistedState | null {
+  try {
+    if (!fs.existsSync(stateFilePath)) {
+      return null;
+    }
+
+    const raw = fs.readFileSync(stateFilePath, "utf8");
+    const parsed = JSON.parse(raw) as Partial<LoafPersistedState>;
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+
+    const authProvider =
+      parsed.authProvider === "openai"
+        ? "openai"
+        : parsed.authProvider === "openrouter" || parsed.authProvider === "vertex"
+          ? "openrouter"
+          : undefined;
+    const parsedProviders = Array.isArray(parsed.authProviders)
+      ? (parsed.authProviders as string[])
+      : [];
+    const authProviders = dedupeAuthProviders(
+      parsedProviders.length > 0
+        ? parsedProviders
+            .map((provider) => (provider === "vertex" ? "openrouter" : provider))
+            .filter((provider): provider is AuthProvider => provider === "openai" || provider === "openrouter")
+        : authProvider
+          ? [authProvider]
+          : [],
+    );
+
+    const selectedModel =
+      typeof parsed.selectedModel === "string" && parsed.selectedModel.trim()
+        ? parsed.selectedModel.trim()
+        : undefined;
+
+    const selectedThinking = isThinkingLevel(parsed.selectedThinking)
+      ? parsed.selectedThinking
+      : undefined;
+
+    const inputHistory = Array.isArray(parsed.inputHistory)
+      ? parsed.inputHistory
+          .filter((item): item is string => typeof item === "string")
+          .map((item) => item.trim())
+          .filter(Boolean)
+          .slice(-MAX_HISTORY_ITEMS)
+      : [];
+
+    return {
+      version: 1,
+      authProviders: authProviders.length > 0 ? authProviders : undefined,
+      authProvider,
+      selectedModel,
+      selectedThinking,
+      openRouterApiKey:
+        typeof parsed.openRouterApiKey === "string" && parsed.openRouterApiKey.trim()
+          ? parsed.openRouterApiKey.trim()
+          : undefined,
+      exaApiKey:
+        typeof parsed.exaApiKey === "string" && parsed.exaApiKey.trim()
+          ? parsed.exaApiKey.trim()
+          : undefined,
+      selectedOpenRouterProvider:
+        typeof parsed.selectedOpenRouterProvider === "string" && parsed.selectedOpenRouterProvider.trim()
+          ? parsed.selectedOpenRouterProvider.trim()
+          : undefined,
+      onboardingCompleted: parsed.onboardingCompleted === true,
+      inputHistory,
+      updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function dedupeAuthProviders(providers: AuthProvider[]): AuthProvider[] {
+  const ordered: AuthProvider[] = [];
+  for (const provider of providers) {
+    if ((provider !== "openai" && provider !== "openrouter") || ordered.includes(provider)) {
+      continue;
+    }
+    ordered.push(provider);
+  }
+  return ordered;
+}
+
+function writeStateToPath(stateFilePath: string, payload: LoafPersistedState): void {
+  const stateDir = path.dirname(stateFilePath);
+  const tmpPath = `${stateFilePath}.tmp`;
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(tmpPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+    fs.renameSync(tmpPath, stateFilePath);
+  } catch {
+    try {
+      if (fs.existsSync(tmpPath)) {
+        fs.unlinkSync(tmpPath);
+      }
+    } catch {
+      // ignore cleanup failures
+    }
+  }
+}
+
+function isThinkingLevel(value: unknown): value is ThinkingLevel {
+  return (
+    value === "OFF" ||
+    value === "MINIMAL" ||
+    value === "LOW" ||
+    value === "MEDIUM" ||
+    value === "HIGH" ||
+    value === "XHIGH"
+  );
+}
+
+function getStateFilePath(): string {
+  return path.join(getLoafDataDir(), "state.json");
+}
+
+export function getLoafDataDir(): string {
+  const baseDir = getStateBaseDir();
+  return path.join(baseDir, "loaf");
+}
+
+export function clearPersistedConfig(): void {
+  const dataDir = getLoafDataDir();
+  const targetFiles = [
+    path.join(dataDir, "state.json"),
+    path.join(dataDir, "auth.json"),
+    path.join(dataDir, "models-cache.json"),
+  ];
+
+  for (const filePath of targetFiles) {
+    try {
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    } catch {
+      // best-effort cleanup
+    }
+  }
+
+  try {
+    if (fs.existsSync(LEGACY_STATE_FILE_PATH)) {
+      fs.unlinkSync(LEGACY_STATE_FILE_PATH);
+    }
+  } catch {
+    // best-effort cleanup
+  }
+}
+
+function getStateBaseDir(): string {
+  if (process.platform === "win32") {
+    const appData = process.env.APPDATA?.trim();
+    if (appData) {
+      return appData;
+    }
+
+    const localAppData = process.env.LOCALAPPDATA?.trim();
+    if (localAppData) {
+      return localAppData;
+    }
+  }
+
+  const xdgStateHome = process.env.XDG_STATE_HOME?.trim();
+  if (xdgStateHome) {
+    return xdgStateHome;
+  }
+
+  const home = os.homedir();
+  if (process.platform === "darwin") {
+    return path.join(home, "Library", "Application Support");
+  }
+
+  return path.join(home, ".local", "state");
+}

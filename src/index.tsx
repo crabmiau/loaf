@@ -1,0 +1,2635 @@
+﻿import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Box, Newline, render, Text, useApp, useInput } from "ink";
+import TextInput from "ink-text-input";
+import { loafConfig, type AuthProvider, type ThinkingLevel } from "./config.js";
+import {
+  clearPersistedConfig,
+  loadPersistedState,
+  savePersistedState,
+  type LoafPersistedState,
+} from "./persistence.js";
+import { getPersistedOpenAiChatgptAuth, runOpenAiOauthLogin } from "./openai-oauth.js";
+import {
+  discoverOpenAiModelOptions,
+  discoverOpenRouterModelOptions,
+  getDefaultModelOptionsForProvider,
+  modelIdToLabel,
+  modelIdToSlug,
+  type ModelOption,
+} from "./models.js";
+import { runOpenAiInferenceStream } from "./openai.js";
+import { listOpenRouterProvidersForModel, runOpenRouterInferenceStream } from "./openrouter.js";
+import { ensurePythonRuntime } from "./python-runtime.js";
+import { configureBuiltinTools, defaultToolRegistry } from "./tools/index.js";
+import type { ChatMessage, DebugEvent } from "./vertex.js";
+
+type UiMessage = {
+  id: number;
+  kind: "user" | "assistant" | "system";
+  text: string;
+};
+
+type AuthOption = {
+  id: AuthProvider;
+  label: string;
+  description: string;
+};
+
+type ThinkingOption = {
+  id: string;
+  label: string;
+  description: string;
+};
+
+type OpenRouterProviderOption = {
+  id: string;
+  label: string;
+  description: string;
+};
+
+type CommandOption = {
+  name: string;
+  description: string;
+};
+
+type OnboardingOption = {
+  id: "auth_openai" | "auth_openrouter" | "auth_continue";
+  label: string;
+  description: string;
+};
+
+type SelectorState =
+  | {
+      kind: "onboarding";
+      title: string;
+      index: number;
+      options: OnboardingOption[];
+    }
+  | {
+      kind: "auth";
+      title: string;
+      index: number;
+      options: AuthOption[];
+      returnToOnboarding?: boolean;
+    }
+  | {
+      kind: "openrouter_api_key";
+      title: string;
+      returnToOnboarding?: boolean;
+    }
+  | {
+      kind: "exa_api_key";
+      title: string;
+      returnToOnboarding?: boolean;
+    }
+  | {
+      kind: "model";
+      title: string;
+      index: number;
+      options: ModelOption[];
+    }
+  | {
+      kind: "thinking";
+      title: string;
+      index: number;
+      modelId: string;
+      modelLabel: string;
+      modelProvider: AuthProvider;
+      options: ThinkingOption[];
+    }
+  | {
+      kind: "openrouter_provider";
+      title: string;
+      index: number;
+      modelId: string;
+      modelLabel: string;
+      modelProvider: AuthProvider;
+      thinkingLevel: ThinkingLevel;
+      options: OpenRouterProviderOption[];
+    };
+
+const AUTH_OPTIONS: AuthOption[] = [
+  {
+    id: "openai",
+    label: "openai oauth",
+    description: "chatgpt account login (codex auth flow)",
+  },
+  {
+    id: "openrouter",
+    label: "openrouter api key",
+    description: "enter your openrouter key in /auth",
+  },
+];
+
+const THINKING_OPTION_DETAILS: Record<ThinkingLevel, { label: string; description: string }> = {
+  OFF: { label: "off", description: "disable reasoning effort" },
+  MINIMAL: { label: "minimal", description: "very light reasoning, fastest with thinking" },
+  LOW: { label: "low", description: "fast with lighter reasoning" },
+  MEDIUM: { label: "medium", description: "balanced depth and speed" },
+  HIGH: { label: "high", description: "maximum reasoning depth" },
+  XHIGH: { label: "xhigh", description: "extra high reasoning depth for hardest tasks" },
+};
+
+const THINKING_OPTIONS_OPENAI_DEFAULT: ThinkingOption[] = toThinkingOptions([
+  "OFF",
+  "MINIMAL",
+  "LOW",
+  "MEDIUM",
+  "HIGH",
+  "XHIGH",
+]);
+const THINKING_OPTIONS_OPENROUTER_DEFAULT: ThinkingOption[] = toThinkingOptions([
+  "OFF",
+  "MINIMAL",
+  "LOW",
+  "MEDIUM",
+  "HIGH",
+]);
+const OPENROUTER_PROVIDER_ANY_ID = "any";
+
+const COMMAND_OPTIONS: CommandOption[] = [
+  { name: "/auth", description: "add auth provider" },
+  { name: "/onboarding", description: "open setup flow (auth + exa key)" },
+  { name: "/forgeteverything", description: "wipe local config and restart onboarding" },
+  { name: "/model", description: "choose model and thinking level" },
+  { name: "/tools", description: "list registered tools" },
+  { name: "/clear", description: "clear conversation messages" },
+  { name: "/help", description: "show available commands" },
+];
+
+const SUPER_DEBUG_COMMAND = "/superdebug-69";
+const MAX_INPUT_HISTORY = 200;
+const MAX_VISIBLE_MESSAGES = 14;
+const GLYPH_USER = "\u2937 ";
+const GLYPH_ASSISTANT = "\u27E3 ";
+const GLYPH_SYSTEM = "\u2301 ";
+const SEARCH_WEB_PROMPT_EXTENSION = [
+  "for facts that may be stale/uncertain (dates, releases, pricing, availability, docs), proactively use search_web.",
+  "prefer at least one search_web pass before answering factual questions from memory.",
+  "if search results are weak or conflicting, refine the query and search_web again before switching tools.",
+  "for factual web lookups, call search_web first and use returned highlights before writing python scrapers.",
+].join("\n");
+
+function App() {
+  const { exit } = useApp();
+  const initialModelOptionsByProvider = useMemo(
+    () =>
+      ({
+        openai: getDefaultModelOptionsForProvider("openai"),
+        openrouter: getDefaultModelOptionsForProvider("openrouter"),
+      }) satisfies Record<AuthProvider, ModelOption[]>,
+    [],
+  );
+  const persistedState = useMemo(() => loadPersistedState(), []);
+  const initialOpenAiAuth = getPersistedOpenAiChatgptAuth();
+  const initialEnabledProviders = resolveInitialEnabledProviders({
+    persistedProviders: persistedState?.authProviders,
+    legacyProvider: persistedState?.authProvider,
+    hasOpenAiToken: Boolean(initialOpenAiAuth?.accessToken),
+    hasOpenRouterKey: Boolean((persistedState?.openRouterApiKey ?? loafConfig.openrouterApiKey).trim()),
+  });
+  const initialModel = resolveInitialModel(
+    initialEnabledProviders,
+    persistedState?.selectedModel,
+    initialModelOptionsByProvider,
+  );
+  const initialModelProvider =
+    findProviderForModel(
+      initialModel,
+      getModelOptionsForProviders(initialEnabledProviders, initialModelOptionsByProvider),
+    ) ?? null;
+  const initialThinking = normalizeThinkingForModel(
+    initialModel,
+    initialModelProvider,
+    persistedState?.selectedThinking ?? loafConfig.thinkingLevel,
+    initialModelOptionsByProvider,
+  );
+  const initialInputHistory = persistedState?.inputHistory ?? [];
+  const initialExaApiKey = persistedState?.exaApiKey ?? loafConfig.exaApiKey;
+  const initialOnboardingCompleted = resolveInitialOnboardingCompleted(persistedState);
+  const [input, setInput] = useState("");
+  const [pending, setPending] = useState(false);
+  const [statusLabel, setStatusLabel] = useState("ready");
+  const [superDebug, setSuperDebug] = useState(false);
+  const [onboardingCompleted, setOnboardingCompleted] = useState<boolean>(initialOnboardingCompleted);
+  const [enabledProviders, setEnabledProviders] = useState<AuthProvider[]>(initialEnabledProviders);
+  const [openAiAccessToken, setOpenAiAccessToken] = useState(initialOpenAiAuth?.accessToken ?? "");
+  const [openAiAccountId, setOpenAiAccountId] = useState<string | null>(initialOpenAiAuth?.accountId ?? null);
+  const [openRouterApiKey, setOpenRouterApiKey] = useState(
+    persistedState?.openRouterApiKey ?? loafConfig.openrouterApiKey,
+  );
+  const [exaApiKey, setExaApiKey] = useState(initialExaApiKey);
+  const [selectedOpenRouterProvider, setSelectedOpenRouterProvider] = useState(
+    persistedState?.selectedOpenRouterProvider ?? OPENROUTER_PROVIDER_ANY_ID,
+  );
+  const [modelOptionsByProvider, setModelOptionsByProvider] = useState<Record<AuthProvider, ModelOption[]>>(
+    initialModelOptionsByProvider,
+  );
+  const [selectedModel, setSelectedModel] = useState(initialModel);
+  const [selectedThinking, setSelectedThinking] = useState<ThinkingLevel>(initialThinking);
+  const [conversationProvider, setConversationProvider] = useState<AuthProvider | null>(null);
+  const [selector, setSelector] = useState<SelectorState | null>(null);
+  const [commandIndex, setCommandIndex] = useState(0);
+  const [history, setHistory] = useState<ChatMessage[]>([]);
+  const [inputHistory, setInputHistory] = useState<string[]>(initialInputHistory);
+  const [inputHistoryIndex, setInputHistoryIndex] = useState<number | null>(null);
+  const [inputHistoryDraft, setInputHistoryDraft] = useState("");
+  const [messages, setMessages] = useState<UiMessage[]>([]);
+  const nextIdRef = useRef(1);
+
+  const nextMessageId = () => {
+    const id = nextIdRef.current;
+    nextIdRef.current += 1;
+    return id;
+  };
+
+  const activeModelOptions = useMemo(
+    () => getModelOptionsForProviders(enabledProviders, modelOptionsByProvider),
+    [enabledProviders, modelOptionsByProvider],
+  );
+
+  const selectedModelProvider = useMemo(
+    () => findProviderForModel(selectedModel, activeModelOptions) ?? null,
+    [selectedModel, activeModelOptions],
+  );
+
+  const commandSuggestions = useMemo(() => {
+    if (!input.startsWith("/")) {
+      return [] as CommandOption[];
+    }
+    const query = input.trim().toLowerCase();
+    if (!query) {
+      return COMMAND_OPTIONS;
+    }
+    return COMMAND_OPTIONS.filter((command) => command.name.startsWith(query));
+  }, [input]);
+
+  useEffect(() => {
+    setCommandIndex((current) => {
+      if (commandSuggestions.length === 0) {
+        return 0;
+      }
+      return Math.min(current, commandSuggestions.length - 1);
+    });
+  }, [commandSuggestions.length]);
+
+  useEffect(() => {
+    configureBuiltinTools({
+      exaApiKey,
+    });
+  }, [exaApiKey]);
+
+  useEffect(() => {
+    savePersistedState({
+      authProviders: enabledProviders,
+      selectedModel,
+      selectedThinking,
+      openRouterApiKey,
+      exaApiKey,
+      selectedOpenRouterProvider,
+      onboardingCompleted,
+      inputHistory,
+    });
+  }, [
+    enabledProviders,
+    selectedModel,
+    selectedThinking,
+    openRouterApiKey,
+    exaApiKey,
+    selectedOpenRouterProvider,
+    onboardingCompleted,
+    inputHistory,
+  ]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      for (const provider of enabledProviders) {
+        if (provider === "openai") {
+          if (!openAiAccessToken.trim()) {
+            continue;
+          }
+
+          const result = await discoverOpenAiModelOptions({
+            accessToken: openAiAccessToken,
+            chatgptAccountId: openAiAccountId,
+          });
+          if (cancelled) {
+            return;
+          }
+
+          setModelOptionsByProvider((current) => ({
+            ...current,
+            openai: result.models,
+          }));
+          continue;
+        }
+
+        if (!openRouterApiKey.trim()) {
+          continue;
+        }
+
+        const result = await discoverOpenRouterModelOptions({
+          apiKey: openRouterApiKey,
+        });
+        if (cancelled) {
+          return;
+        }
+
+        setModelOptionsByProvider((current) => ({
+          ...current,
+          openrouter: result.models,
+        }));
+      }
+
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [enabledProviders, openAiAccessToken, openAiAccountId, openRouterApiKey]);
+
+  useEffect(() => {
+    setSelectedModel((currentModel) =>
+      resolveModelForEnabledProviders(enabledProviders, currentModel, modelOptionsByProvider),
+    );
+  }, [enabledProviders, modelOptionsByProvider]);
+
+  useEffect(() => {
+    const provider = findProviderForModel(selectedModel, activeModelOptions);
+    if (!provider) {
+      return;
+    }
+
+    setSelectedThinking((currentThinking) =>
+      normalizeThinkingForModel(selectedModel, provider, currentThinking, modelOptionsByProvider),
+    );
+  }, [selectedModel, activeModelOptions, modelOptionsByProvider]);
+
+  const appendSystemMessage = (text: string) => {
+    setMessages((current) => [
+      ...current,
+      {
+        id: nextMessageId(),
+        kind: "system",
+        text,
+      },
+    ]);
+  };
+
+  const appendDebugEvent = (event: DebugEvent) => {
+    if (!superDebug) {
+      return;
+    }
+
+    const payload = safeJsonStringify(event.data);
+    appendSystemMessage(
+      `[debug] ${event.stage}\n${payload}`,
+    );
+  };
+
+  const appendToolEvents = (event: DebugEvent) => {
+    if (event.stage !== "tool_results") {
+      return;
+    }
+
+    const rows = formatToolRows(event.data);
+    for (const row of rows) {
+      appendSystemMessage(row);
+    }
+  };
+
+  const openOnboardingSelector = () => {
+    setInput("");
+    setSelector({
+      kind: "onboarding",
+      title: "onboarding 1/2 - auth providers",
+      index: 0,
+      options: buildOnboardingAuthOptions(enabledProviders),
+    });
+  };
+
+  useEffect(() => {
+    if (selector) {
+      return;
+    }
+    if (!onboardingCompleted) {
+      setSelector({
+        kind: "onboarding",
+        title: "onboarding 1/2 - auth providers",
+        index: 0,
+        options: buildOnboardingAuthOptions(enabledProviders),
+      });
+      return;
+    }
+    if (enabledProviders.length === 0) {
+      setSelector({
+        kind: "auth",
+        title: "select auth provider",
+        index: 0,
+        options: AUTH_OPTIONS,
+      });
+    }
+  }, [enabledProviders, exaApiKey, onboardingCompleted, selector]);
+
+  const openAuthSelector = (returnToOnboarding = false) => {
+    setInput("");
+    const firstMissing = AUTH_OPTIONS.find((option) => !enabledProviders.includes(option.id));
+    const defaultIndex = firstMissing
+      ? AUTH_OPTIONS.findIndex((option) => option.id === firstMissing.id)
+      : 0;
+    setSelector({
+      kind: "auth",
+      title: "add auth provider",
+      index: defaultIndex,
+      options: AUTH_OPTIONS,
+      returnToOnboarding,
+    });
+  };
+
+  const openExaApiKeySelector = (returnToOnboarding = false) => {
+    setInput("");
+    setSelector({
+      kind: "exa_api_key",
+      title: "onboarding 2/2 - exa api key (or type 'skip')",
+      returnToOnboarding,
+    });
+  };
+
+  const applyAuthProviderSelection = async (
+    provider: AuthProvider,
+    openRouterKeyOverride?: string,
+    returnToOnboarding = false,
+  ): Promise<boolean> => {
+    if (provider === "openrouter") {
+      const key = (openRouterKeyOverride ?? openRouterApiKey).trim();
+      if (!key) {
+        setInput("");
+        setSelector({
+          kind: "openrouter_api_key",
+          title: "enter openrouter api key",
+          returnToOnboarding,
+        });
+        appendSystemMessage("enter your openrouter api key and press enter.");
+        return false;
+      }
+      setOpenRouterApiKey(key);
+
+      try {
+        const result = await discoverOpenRouterModelOptions({
+          apiKey: key,
+        });
+        setModelOptionsByProvider((current) => ({
+          ...current,
+          openrouter: result.models,
+        }));
+        appendSystemMessage(`openrouter models synced: ${result.models.length} (${result.source})`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        appendSystemMessage(`openrouter model sync failed: ${message}`);
+      }
+
+      if (enabledProviders.includes(provider)) {
+        appendSystemMessage("openrouter auth already enabled (api key updated).");
+        return true;
+      }
+    } else {
+      if (enabledProviders.includes(provider)) {
+        appendSystemMessage(`${provider} auth already enabled.`);
+        return true;
+      }
+
+      let accessToken = openAiAccessToken.trim();
+      let accountId = openAiAccountId?.trim() || null;
+      if (!accessToken) {
+        setPending(true);
+        setStatusLabel("opening browser login...");
+        appendSystemMessage("starting chatgpt account login in your browser...");
+        try {
+          const loginResult = await runOpenAiOauthLogin();
+          accessToken = loginResult.chatgptAuth.accessToken;
+          accountId = loginResult.chatgptAuth.accountId;
+          setOpenAiAccessToken(accessToken);
+          setOpenAiAccountId(accountId);
+          appendSystemMessage("chatgpt oauth login complete.");
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          appendSystemMessage(`chatgpt oauth login failed: ${message}`);
+          return false;
+        } finally {
+          setPending(false);
+          setStatusLabel("ready");
+        }
+      }
+    }
+
+    const nextEnabledProviders = dedupeAuthProviders([...enabledProviders, provider]);
+    const nextModel = resolveModelForEnabledProviders(
+      nextEnabledProviders,
+      selectedModel,
+      modelOptionsByProvider,
+    );
+    const nextModelProvider =
+      findProviderForModel(nextModel, getModelOptionsForProviders(nextEnabledProviders, modelOptionsByProvider)) ??
+      null;
+    const nextThinking = normalizeThinkingForModel(
+      nextModel,
+      nextModelProvider,
+      selectedThinking,
+      modelOptionsByProvider,
+    );
+    setEnabledProviders(nextEnabledProviders);
+    setSelectedModel(nextModel);
+    setSelectedThinking(nextThinking);
+    if (provider === "openrouter" && !selectedOpenRouterProvider.trim()) {
+      setSelectedOpenRouterProvider(OPENROUTER_PROVIDER_ANY_ID);
+    }
+    appendSystemMessage(
+      `auth provider added: ${provider}. enabled: ${nextEnabledProviders.join(", ")}`,
+    );
+    return true;
+  };
+
+  const applyExaApiKeySelection = (rawValue: string): "saved" | "skipped" | "invalid" => {
+    const value = rawValue.trim();
+    if (!value) {
+      return "invalid";
+    }
+
+    if (value.toLowerCase() === "skip") {
+      setExaApiKey("");
+      appendSystemMessage("exa api key skipped. search_web will be unavailable.");
+      return "skipped";
+    }
+
+    setExaApiKey(value);
+    appendSystemMessage("exa api key saved. search_web is now available.");
+    return "saved";
+  };
+
+  const openModelSelector = () => {
+    if (!onboardingCompleted) {
+      openOnboardingSelector();
+      return;
+    }
+    if (enabledProviders.length === 0) {
+      openAuthSelector(false);
+      return;
+    }
+
+    setInput("");
+    const modelOptions = getModelOptionsForProviders(enabledProviders, modelOptionsByProvider);
+    const selectedIndex = Math.max(
+      0,
+      modelOptions.findIndex((option) => option.id === selectedModel),
+    );
+    setSelector({
+      kind: "model",
+      title: "select model",
+      index: selectedIndex,
+      options: modelOptions,
+    });
+  };
+
+  const getModelSelectorOptions = (currentSelector: SelectorState | null): ModelOption[] => {
+    if (!currentSelector || currentSelector.kind !== "model") {
+      return [];
+    }
+    const query = input.trim().toLowerCase();
+    if (!query) {
+      return currentSelector.options;
+    }
+    return currentSelector.options.filter((option) => {
+      const label = option.label.toLowerCase();
+      const id = option.id.toLowerCase();
+      const description = option.description.toLowerCase();
+      return label.includes(query) || id.includes(query) || description.includes(query);
+    });
+  };
+
+  const getSelectorAllOptions = (
+    currentSelector: SelectorState,
+  ): Array<AuthOption | ModelOption | ThinkingOption | OpenRouterProviderOption | OnboardingOption> => {
+    if (currentSelector.kind === "openrouter_api_key" || currentSelector.kind === "exa_api_key") {
+      return [];
+    }
+    if (currentSelector.kind === "model") {
+      return getModelSelectorOptions(currentSelector);
+    }
+    return currentSelector.options;
+  };
+
+  const getSelectorOptionWindow = (
+    options: Array<AuthOption | ModelOption | ThinkingOption | OpenRouterProviderOption | OnboardingOption>,
+    index: number,
+  ) => {
+    const WINDOW_SIZE = 10;
+    if (options.length <= WINDOW_SIZE) {
+      return {
+        startIndex: 0,
+        activeIndex: Math.max(0, Math.min(index, Math.max(0, options.length - 1))),
+        options,
+      };
+    }
+
+    const activeIndex = Math.max(0, Math.min(index, options.length - 1));
+    const halfWindow = Math.floor(WINDOW_SIZE / 2);
+    const maxStart = Math.max(0, options.length - WINDOW_SIZE);
+    const startIndex = Math.max(0, Math.min(activeIndex - halfWindow, maxStart));
+    return {
+      startIndex,
+      activeIndex,
+      options: options.slice(startIndex, startIndex + WINDOW_SIZE),
+    };
+  };
+
+  const applyModelSelection = (params: {
+    modelId: string;
+    modelLabel: string;
+    modelProvider: AuthProvider;
+    thinkingLevel: ThinkingLevel;
+    openRouterProvider?: string;
+  }) => {
+    const providerChanged =
+      selectedModelProvider !== null && selectedModelProvider !== params.modelProvider;
+
+    setSelectedModel(params.modelId);
+    setSelectedThinking(params.thinkingLevel);
+
+    if (params.modelProvider === "openrouter") {
+      setSelectedOpenRouterProvider((params.openRouterProvider ?? OPENROUTER_PROVIDER_ANY_ID).trim() || OPENROUTER_PROVIDER_ANY_ID);
+    }
+
+    if (providerChanged) {
+      resetConversationForProviderSwitch({
+        fromProvider: selectedModelProvider,
+        toProvider: params.modelProvider,
+        setHistory,
+        setMessages,
+        nextMessageId,
+      });
+      setConversationProvider(null);
+    }
+
+    const providerSuffix =
+      params.modelProvider === "openrouter"
+        ? ` | provider ${params.openRouterProvider ?? OPENROUTER_PROVIDER_ANY_ID}`
+        : "";
+    appendSystemMessage(
+      `model updated: ${params.modelLabel} (${params.thinkingLevel.toLowerCase()})${providerSuffix}${providerChanged ? " - context reset for provider switch" : ""}`,
+    );
+    setInput("");
+    setSelector(null);
+  };
+
+  const applyCommand = (rawCommand: string) => {
+    const command = rawCommand.trim().toLowerCase();
+    if (!command) {
+      return;
+    }
+
+    if (command === "/auth") {
+      openAuthSelector(false);
+      return;
+    }
+
+    if (command === "/onboarding") {
+      openOnboardingSelector();
+      return;
+    }
+
+    if (command === "/forgeteverything") {
+      clearPersistedConfig();
+      setEnabledProviders([]);
+      setOpenAiAccessToken("");
+      setOpenAiAccountId(null);
+      setOpenRouterApiKey("");
+      setExaApiKey("");
+      setSelectedOpenRouterProvider(OPENROUTER_PROVIDER_ANY_ID);
+      setModelOptionsByProvider(initialModelOptionsByProvider);
+      setSelectedModel("");
+      setSelectedThinking(loafConfig.thinkingLevel);
+      setPending(false);
+      setStatusLabel("ready");
+      setConversationProvider(null);
+      setHistory([]);
+      setInputHistory([]);
+      setInputHistoryIndex(null);
+      setInputHistoryDraft("");
+      setOnboardingCompleted(false);
+      setInput("");
+      setSelector({
+        kind: "onboarding",
+        title: "onboarding 1/2 - auth providers",
+        index: 0,
+        options: buildOnboardingAuthOptions([]),
+      });
+      setMessages([
+        {
+          id: nextMessageId(),
+          kind: "system",
+          text: "all local config was cleared. onboarding restarted.",
+        },
+      ]);
+      return;
+    }
+
+    if (command === "/model") {
+      openModelSelector();
+      return;
+    }
+
+    if (command === "/clear") {
+      setMessages([]);
+      setHistory([]);
+      setConversationProvider(null);
+      return;
+    }
+
+    if (command === "/tools") {
+      const lines = defaultToolRegistry
+        .list()
+        .map((tool) => `${tool.name} - ${tool.description}`)
+        .join("\n");
+      appendSystemMessage(`registered tools:\n${lines}`);
+      return;
+    }
+
+    if (command === "/help") {
+      const commandLines = COMMAND_OPTIONS.map((option) => `${option.name} - ${option.description}`).join("\n");
+      appendSystemMessage(`available commands:\n${commandLines}`);
+      return;
+    }
+
+    if (command === SUPER_DEBUG_COMMAND) {
+      const next = !superDebug;
+      setSuperDebug(next);
+      appendSystemMessage(`superdebug: ${next ? "on" : "off"}`);
+      return;
+    }
+
+    appendSystemMessage(`unknown command: ${command}`);
+  };
+
+  const runSlashCommand = (rawInput: string) => {
+    const trimmed = rawInput.trim();
+    if (!trimmed.startsWith("/")) {
+      return false;
+    }
+
+    let commandToRun = trimmed.split(/\s+/)[0].toLowerCase();
+    if (
+      commandToRun !== SUPER_DEBUG_COMMAND &&
+      commandSuggestions.length > 0 &&
+      !COMMAND_OPTIONS.some((option) => option.name === commandToRun)
+    ) {
+      commandToRun = commandSuggestions[Math.min(commandIndex, commandSuggestions.length - 1)]!.name;
+    }
+
+    setInput("");
+    setInputHistoryIndex(null);
+    setInputHistoryDraft("");
+    applyCommand(commandToRun);
+    return true;
+  };
+
+  const navigateInputHistory = (direction: "up" | "down"): boolean => {
+    if (inputHistory.length === 0) {
+      return false;
+    }
+
+    if (direction === "up") {
+      if (inputHistoryIndex === null) {
+        setInputHistoryDraft(input);
+        const nextIndex = inputHistory.length - 1;
+        setInputHistoryIndex(nextIndex);
+        setInput(inputHistory[nextIndex] ?? "");
+        return true;
+      }
+
+      if (inputHistoryIndex > 0) {
+        const nextIndex = inputHistoryIndex - 1;
+        setInputHistoryIndex(nextIndex);
+        setInput(inputHistory[nextIndex] ?? "");
+      }
+      return true;
+    }
+
+    if (inputHistoryIndex === null) {
+      return false;
+    }
+
+    if (inputHistoryIndex < inputHistory.length - 1) {
+      const nextIndex = inputHistoryIndex + 1;
+      setInputHistoryIndex(nextIndex);
+      setInput(inputHistory[nextIndex] ?? "");
+      return true;
+    }
+
+    setInputHistoryIndex(null);
+    setInput(inputHistoryDraft);
+    return true;
+  };
+
+  useInput((character, key) => {
+    if (key.ctrl && character === "c") {
+      exit();
+      return;
+    }
+
+    if (selector) {
+      if (key.escape) {
+        if (selector.kind === "onboarding") {
+          if (!onboardingCompleted) {
+            return;
+          }
+          setInput("");
+          setSelector(null);
+          return;
+        }
+        if (
+          (selector.kind === "openrouter_api_key" || selector.kind === "exa_api_key") &&
+          selector.returnToOnboarding
+        ) {
+          openOnboardingSelector();
+          return;
+        }
+        if (selector.kind === "auth" && selector.returnToOnboarding) {
+          openOnboardingSelector();
+          return;
+        }
+        if (selector.kind === "auth" && enabledProviders.length === 0) {
+          return;
+        }
+        setInput("");
+        setSelector(null);
+        return;
+      }
+
+      if (key.upArrow || key.downArrow) {
+        if (selector.kind === "openrouter_api_key" || selector.kind === "exa_api_key") {
+          return;
+        }
+        setSelector((current) => {
+          if (!current) {
+            return current;
+          }
+          if (current.kind === "openrouter_api_key" || current.kind === "exa_api_key") {
+            return current;
+          }
+          const direction = key.downArrow ? 1 : -1;
+          const optionCount =
+            current.kind === "model"
+              ? Math.max(1, getModelSelectorOptions(current).length)
+              : current.options.length;
+          const nextIndex = (current.index + direction + optionCount) % optionCount;
+          return {
+            ...current,
+            index: nextIndex,
+          };
+        });
+        return;
+      }
+
+      if (key.return) {
+        if (pending) {
+          return;
+        }
+
+        if (selector.kind === "onboarding") {
+          const onboardingChoice = selector.options[selector.index];
+          if (!onboardingChoice) {
+            return;
+          }
+          if (onboardingChoice.id === "auth_openai") {
+            openAuthSelector(true);
+            return;
+          }
+          if (onboardingChoice.id === "auth_openrouter") {
+            openAuthSelector(true);
+            return;
+          }
+          openExaApiKeySelector(true);
+          appendSystemMessage("enter your exa api key, or type 'skip'.");
+          return;
+        }
+
+        if (selector.kind === "exa_api_key") {
+          const exaInput = input.trim();
+          if (!exaInput) {
+            appendSystemMessage("exa api key cannot be empty. type 'skip' to skip.");
+            return;
+          }
+          const result = applyExaApiKeySelection(exaInput);
+          if (result === "invalid") {
+            appendSystemMessage("invalid exa api key input.");
+            return;
+          }
+          setInput("");
+          if (selector.returnToOnboarding) {
+            setOnboardingCompleted(true);
+            setSelector(null);
+            appendSystemMessage("onboarding complete. you can use /auth and /model any time.");
+          } else {
+            setSelector(null);
+          }
+          return;
+        }
+
+        if (selector.kind === "openrouter_api_key") {
+          const keyInput = input.trim();
+          if (!keyInput) {
+            appendSystemMessage("openrouter api key cannot be empty.");
+            return;
+          }
+          void (async () => {
+            const ok = await applyAuthProviderSelection(
+              "openrouter",
+              keyInput,
+              selector.returnToOnboarding === true,
+            );
+            if (ok) {
+              appendSystemMessage("openrouter api key saved.");
+              setInput("");
+              if (selector.returnToOnboarding) {
+                openOnboardingSelector();
+              } else {
+                setSelector(null);
+              }
+            }
+          })();
+          return;
+        }
+
+        if (selector.kind === "auth") {
+          const authChoice = selector.options[selector.index];
+          if (!authChoice) {
+            return;
+          }
+          void (async () => {
+            const ok = await applyAuthProviderSelection(
+              authChoice.id,
+              undefined,
+              selector.returnToOnboarding === true,
+            );
+            if (ok) {
+              if (selector.returnToOnboarding) {
+                openOnboardingSelector();
+              } else {
+                setSelector(null);
+              }
+            }
+          })();
+          return;
+        }
+
+        if (selector.kind === "model") {
+          const visibleOptions = getModelSelectorOptions(selector);
+          const modelChoice = visibleOptions[selector.index];
+          if (!modelChoice) {
+            appendSystemMessage("no model matches your search.");
+            return;
+          }
+          const thinkingOptions = getThinkingOptionsForModel(
+            modelChoice.id,
+            modelChoice.provider,
+            modelOptionsByProvider,
+          );
+          const defaultThinking = normalizeThinkingForModel(
+            modelChoice.id,
+            modelChoice.provider,
+            selectedThinking,
+            modelOptionsByProvider,
+          );
+          const defaultIndex = Math.max(
+            0,
+            thinkingOptions.findIndex((option) => option.id === defaultThinking),
+          );
+
+          setSelector({
+            kind: "thinking",
+            title: `select thinking level for ${modelChoice.label}`,
+            index: defaultIndex,
+            modelId: modelChoice.id,
+            modelLabel: modelChoice.label,
+            modelProvider: modelChoice.provider,
+            options: thinkingOptions,
+          });
+          setInput("");
+          return;
+        }
+
+        if (selector.kind === "thinking") {
+          const thinkingChoice = selector.options[selector.index];
+          if (!thinkingChoice) {
+            return;
+          }
+          if (selector.modelProvider === "openrouter") {
+            void (async () => {
+              let discoveredProviders: string[] = [];
+              if (openRouterApiKey.trim()) {
+                setPending(true);
+                setStatusLabel("loading providers...");
+                try {
+                  discoveredProviders = await listOpenRouterProvidersForModel(openRouterApiKey, selector.modelId);
+                  if (discoveredProviders.length > 0) {
+                    setModelOptionsByProvider((current) => ({
+                      ...current,
+                      openrouter: current.openrouter.map((option) =>
+                        option.id === selector.modelId
+                          ? { ...option, routingProviders: discoveredProviders }
+                          : option,
+                      ),
+                    }));
+                  }
+                } catch (error) {
+                  const message = error instanceof Error ? error.message : String(error);
+                  appendSystemMessage(`openrouter provider fetch failed: ${message}`);
+                } finally {
+                  setPending(false);
+                  setStatusLabel("ready");
+                }
+              }
+
+              const routeOptions = getOpenRouterProviderOptions(
+                selector.modelId,
+                modelOptionsByProvider,
+                discoveredProviders,
+              );
+              const selectedRoute = normalizeOpenRouterProviderSelection(selectedOpenRouterProvider);
+              const defaultIndex = Math.max(
+                0,
+                routeOptions.findIndex((option) => option.id === selectedRoute),
+              );
+              setSelector({
+                kind: "openrouter_provider",
+                title: `select provider for ${selector.modelLabel}`,
+                index: defaultIndex,
+                modelId: selector.modelId,
+                modelLabel: selector.modelLabel,
+                modelProvider: selector.modelProvider,
+                thinkingLevel: thinkingChoice.id as ThinkingLevel,
+                options: routeOptions,
+              });
+            })();
+            return;
+          }
+
+          applyModelSelection({
+            modelId: selector.modelId,
+            modelLabel: selector.modelLabel,
+            modelProvider: selector.modelProvider,
+            thinkingLevel: thinkingChoice.id as ThinkingLevel,
+          });
+          return;
+        }
+
+        if (selector.kind === "openrouter_provider") {
+          const routeChoice = selector.options[selector.index];
+          if (!routeChoice) {
+            return;
+          }
+          applyModelSelection({
+            modelId: selector.modelId,
+            modelLabel: selector.modelLabel,
+            modelProvider: selector.modelProvider,
+            thinkingLevel: selector.thinkingLevel,
+            openRouterProvider: routeChoice.id,
+          });
+          return;
+        }
+      }
+
+      return;
+    }
+
+    if (input.startsWith("/") && commandSuggestions.length > 0) {
+      if (key.return) {
+        runSlashCommand(input);
+        return;
+      }
+
+      if (key.upArrow || key.downArrow) {
+        const direction = key.downArrow ? 1 : -1;
+        setCommandIndex((current) => {
+          const optionCount = commandSuggestions.length;
+          return (current + direction + optionCount) % optionCount;
+        });
+        return;
+      }
+
+      if (key.tab) {
+        const suggestion = commandSuggestions[commandIndex];
+        if (suggestion) {
+          setInput(suggestion.name);
+        }
+      }
+    }
+
+    if (!input.startsWith("/") && (key.upArrow || key.downArrow)) {
+      const usedHistory = navigateInputHistory(key.upArrow ? "up" : "down");
+      if (usedHistory) {
+        return;
+      }
+    }
+  });
+
+  const visibleMessages = useMemo(() => messages.slice(-MAX_VISIBLE_MESSAGES), [messages]);
+
+  const sendPrompt = async (prompt: string) => {
+    const cleanPrompt = prompt.trim();
+    if (!cleanPrompt || pending) {
+      return;
+    }
+    if (!onboardingCompleted) {
+      appendSystemMessage("finish onboarding first.");
+      openOnboardingSelector();
+      return;
+    }
+    const provider = selectedModelProvider;
+    if (!provider) {
+      appendSystemMessage("select a model from an enabled provider first.");
+      openAuthSelector(false);
+      return;
+    }
+    if (!enabledProviders.includes(provider)) {
+      appendSystemMessage(`provider ${provider} is not enabled. run /auth to add it.`);
+      openAuthSelector(false);
+      return;
+    }
+    if (provider === "openai" && !openAiAccessToken.trim()) {
+      appendSystemMessage("openai model selected, but no chatgpt oauth token is available. run /auth.");
+      openAuthSelector(false);
+      return;
+    }
+    if (provider === "openrouter" && !openRouterApiKey.trim()) {
+      appendSystemMessage("openrouter model selected, but no openrouter api key is available. run /auth.");
+      openAuthSelector(false);
+      return;
+    }
+
+    setInput("");
+    setInputHistory((current) => {
+      const next = [...current, cleanPrompt];
+      return next.slice(-MAX_INPUT_HISTORY);
+    });
+    setInputHistoryIndex(null);
+    setInputHistoryDraft("");
+    setPending(true);
+    setStatusLabel(selectedThinking === "OFF" ? "drafting response..." : "thinking...");
+
+    const providerSwitchRequiresReset =
+      conversationProvider !== null && conversationProvider !== provider && history.length > 0;
+    const historyBase = providerSwitchRequiresReset ? [] : history;
+    if (providerSwitchRequiresReset) {
+      resetConversationForProviderSwitch({
+        fromProvider: conversationProvider,
+        toProvider: provider,
+        setHistory,
+        setMessages,
+        nextMessageId,
+      });
+    }
+
+    const nextHistory = [...historyBase, { role: "user" as const, text: cleanPrompt }];
+    const nextUserMessage: UiMessage = {
+      id: nextMessageId(),
+      kind: "user",
+      text: cleanPrompt,
+    };
+    setMessages((current) => [...current, nextUserMessage]);
+
+    try {
+      const handleChunk = (chunk: { thoughts: string[]; answerText: string }) => {
+        for (const rawThought of chunk.thoughts) {
+          const title = parseThoughtTitle(rawThought);
+          setStatusLabel(`thinking: ${title}`);
+        }
+
+        if (chunk.answerText) {
+          setStatusLabel("drafting response...");
+        }
+      };
+
+      const handleDebug = (event: DebugEvent) => {
+        appendToolEvents(event);
+        appendDebugEvent(event);
+      };
+      const runtimeSystemInstruction = buildRuntimeSystemInstruction({
+        baseInstruction: loafConfig.systemInstruction,
+        hasExaSearch: Boolean(exaApiKey.trim()),
+      });
+
+      const result =
+        provider === "openrouter"
+          ? await runOpenRouterInferenceStream(
+              {
+                apiKey: openRouterApiKey,
+                model: selectedModel,
+                messages: nextHistory,
+                thinkingLevel: selectedThinking,
+                includeThoughts: selectedThinking !== "OFF",
+                forcedProvider:
+                  normalizeOpenRouterProviderSelection(selectedOpenRouterProvider) === OPENROUTER_PROVIDER_ANY_ID
+                    ? null
+                    : normalizeOpenRouterProviderSelection(selectedOpenRouterProvider),
+                systemInstruction: runtimeSystemInstruction,
+              },
+              handleChunk,
+              handleDebug,
+            )
+          : await runOpenAiInferenceStream(
+              {
+                accessToken: openAiAccessToken,
+                chatgptAccountId: openAiAccountId,
+                model: selectedModel,
+                messages: nextHistory,
+                thinkingLevel: selectedThinking,
+                includeThoughts: selectedThinking !== "OFF",
+                systemInstruction: runtimeSystemInstruction,
+              },
+              handleChunk,
+              handleDebug,
+            );
+
+      const assistantMessage: ChatMessage = {
+        role: "assistant",
+        text: result.answer,
+      };
+      setHistory([...nextHistory, assistantMessage]);
+      setConversationProvider(provider);
+
+      setMessages((current) => [
+        ...current,
+        {
+          id: nextMessageId(),
+          kind: "assistant",
+          text: result.answer,
+        },
+      ]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setMessages((current) => [
+        ...current,
+        {
+          id: nextMessageId(),
+          kind: "system",
+          text: `inference error: ${message}`,
+        },
+      ]);
+    } finally {
+      setPending(false);
+      setStatusLabel("ready");
+    }
+  };
+
+  return (
+    <Box flexDirection="column" paddingX={1}>
+      <Text color="cyanBright">loaf | beta</Text>
+      <Text color="gray">
+        auth: {enabledProviders.length > 0 ? enabledProviders.join(", ") : "not selected"} |{" "}
+        model:{" "}
+        {selectedModelProvider
+          ? formatModelSummary(
+              selectedModelProvider,
+              selectedModel,
+              selectedThinking,
+              modelOptionsByProvider,
+              selectedOpenRouterProvider,
+            )
+          : "not selected"}
+      </Text>
+      <Newline />
+      <Box flexDirection="column">
+        {visibleMessages.map((message) => (
+          <MessageRow key={message.id} message={message} />
+        ))}
+      </Box>
+      {selector && (
+        <Box flexDirection="column" marginTop={1}>
+          <Text color="cyanBright">{selector.title}</Text>
+          {selector.kind === "openrouter_api_key" || selector.kind === "exa_api_key" ? (
+            <Text color="gray">
+              {selector.kind === "exa_api_key"
+                ? "paste key, press enter to save. type 'skip' to skip. esc cancels."
+                : "paste key, press enter to save. esc cancels."}
+            </Text>
+          ) : (
+            <>
+              {(() => {
+                const allOptions = getSelectorAllOptions(selector);
+                const windowed = getSelectorOptionWindow(allOptions, selector.index);
+                return (
+                  <>
+                    {windowed.options.map((option, windowIndex) => {
+                      const absoluteIndex = windowed.startIndex + windowIndex;
+                      const selected = absoluteIndex === windowed.activeIndex;
+                      return (
+                        <Text key={`${selector.kind}-${option.id}`} color={selected ? "magentaBright" : "gray"}>
+                          {selected ? ">" : " "} {option.label} - {selector.kind === "model" ? (option as ModelOption).provider : option.description}
+                        </Text>
+                      );
+                    })}
+                    {allOptions.length > windowed.options.length && (
+                      <Text color="gray">
+                        showing {windowed.startIndex + 1}-{windowed.startIndex + windowed.options.length} of {allOptions.length}
+                      </Text>
+                    )}
+                  </>
+                );
+              })()}
+              <Text color="gray">
+                {selector.kind === "onboarding"
+                  ? "use up/down + enter to configure."
+                  : selector.kind === "model"
+                  ? "type to search | up/down select | enter confirm | esc cancels"
+                  : "use up/down + enter. esc cancels."}
+              </Text>
+            </>
+          )}
+        </Box>
+      )}
+      <Newline />
+      {pending && <Text color="yellow">{GLYPH_SYSTEM}{statusLabel}</Text>}
+      {commandSuggestions.length > 0 && !selector && (
+        <Box flexDirection="column" marginTop={1}>
+          {commandSuggestions.map((suggestion, index) => (
+            <Text key={suggestion.name} color={index === commandIndex ? "magentaBright" : "gray"}>
+              {index === commandIndex ? ">" : " "} {suggestion.name} - {suggestion.description}
+            </Text>
+          ))}
+          <Text color="gray">tab autocomplete | up/down navigate suggestions</Text>
+        </Box>
+      )}
+      <Box marginTop={1}>
+        <Text color="magentaBright">{selector ? "select> " : GLYPH_USER}</Text>
+        <TextInput
+          value={input}
+          onChange={(value) => {
+            if (
+              selector?.kind === "openrouter_api_key" ||
+              selector?.kind === "exa_api_key" ||
+              selector?.kind === "model" ||
+              !selector
+            ) {
+              if (inputHistoryIndex !== null) {
+                setInputHistoryIndex(null);
+                setInputHistoryDraft("");
+              }
+              if (selector?.kind === "model") {
+                setSelector((current) => {
+                  if (!current || current.kind !== "model") {
+                    return current;
+                  }
+                  return {
+                    ...current,
+                    index: 0,
+                  };
+                });
+              }
+              setInput(value);
+            }
+          }}
+          onSubmit={(submitted) => {
+            if (selector && selector.kind !== "openrouter_api_key" && selector.kind !== "exa_api_key") {
+              return;
+            }
+
+            const trimmed = submitted.trim();
+            if (!trimmed) {
+              return;
+            }
+
+            if (selector?.kind === "openrouter_api_key" || selector?.kind === "exa_api_key") {
+              return;
+            }
+
+            if (trimmed.startsWith("/")) {
+              runSlashCommand(trimmed);
+              return;
+            }
+
+            sendPrompt(submitted);
+          }}
+          placeholder={
+            selector?.kind === "openrouter_api_key"
+              ? "enter openrouter api key..."
+              : selector?.kind === "exa_api_key"
+                ? "enter exa api key or type 'skip'..."
+              : selector?.kind === "model"
+                ? "search model..."
+                : selector
+                  ? "use selector above..."
+                  : "type a prompt and press enter..."
+          }
+          showCursor
+        />
+      </Box>
+      <Text color="gray">ctrl+c exit | /help for commands</Text>
+    </Box>
+  );
+}
+
+function safeJsonStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function formatToolRows(data: unknown): string[] {
+  const executed = (data as { executed?: unknown })?.executed;
+  if (!Array.isArray(executed)) {
+    return [];
+  }
+
+  const rows: string[] = [];
+  for (const item of executed) {
+    const record = (item ?? {}) as {
+      name?: unknown;
+      ok?: unknown;
+      input?: unknown;
+      result?: unknown;
+      error?: unknown;
+    };
+
+    const name = typeof record.name === "string" && record.name ? record.name : "tool";
+    const ok = Boolean(record.ok);
+    const baseSummary = formatToolSummary(name, record.input, record.result);
+    const summary = ok ? baseSummary : `${baseSummary} (failed)`;
+    const detailBody = formatToolDetail(name, record.input, record.result);
+    const errorLine = `error: ${typeof record.error === "string" ? record.error : "tool execution failed"}`;
+    const detailRaw = ok
+      ? detailBody
+      : detailBody
+        ? `${errorLine}\n${detailBody}`
+        : errorLine;
+    const detail = ok && shouldCollapseSuccessDetail(name)
+      ? collapseRedundantSuccessDetail(summary, detailRaw)
+      : detailRaw;
+
+    rows.push(formatToolRow(summary, detail));
+  }
+
+  return rows;
+}
+
+function shouldCollapseSuccessDetail(name: string): boolean {
+  return name !== "install_pip" && name !== "run_py" && name !== "run_py_module" && name !== "search_web";
+}
+
+function formatToolRow(summary: string, detail: string): string {
+  const lines = detail.replace(/\r\n/g, "\n").split("\n");
+  const firstLine = lines.find((line) => line.trim())?.trim() || "ok";
+  return `${summary}\n  -> ${clipInline(firstLine, 180)}`;
+}
+
+function formatToolSummary(name: string, input: unknown, result: unknown): string {
+  const payload = getToolPayload(input, result);
+  const selector = typeof payload.selector === "string" ? payload.selector : undefined;
+  const x = typeof payload.x === "number" ? payload.x : undefined;
+  const y = typeof payload.y === "number" ? payload.y : undefined;
+
+  if (name === "install_pip") {
+    const packages = getPythonPackages(payload, result);
+    if (packages.length > 0) {
+      return `installed ${packages.length} package(s)`;
+    }
+    return "installed python package(s)";
+  }
+
+  if (name === "run_py") {
+    return "executed python script";
+  }
+
+  if (name === "run_py_module") {
+    const record = isRecord(result) ? result : {};
+    const moduleName = readTrimmedString(record.module) || readTrimmedString(payload.module);
+    if (moduleName) {
+      return `ran python module ${moduleName}`;
+    }
+    return "ran python module";
+  }
+
+  if (name === "search_web") {
+    const query = readTrimmedString(payload.query);
+    if (query) {
+      return `searched web for "${clipInline(query, 72)}"`;
+    }
+    return "searched web";
+  }
+
+  if (name === "click") {
+    if (selector) {
+      return `clicked on ${selector}`;
+    }
+    if (typeof x === "number" && typeof y === "number") {
+      return `clicked at (${x}, ${y})`;
+    }
+    return "clicked";
+  }
+
+  if (name === "type") {
+    if (selector) {
+      return `typed into ${selector}`;
+    }
+    return "typed text";
+  }
+
+  if (name === "scroll") {
+    const target = typeof payload.target === "string" ? payload.target : undefined;
+    if (target) {
+      return `scrolled ${target}`;
+    }
+    return "scrolled";
+  }
+
+  if (name === "drag") {
+    return "dragged";
+  }
+
+  if (name === "wait") {
+    const ms = typeof payload.ms === "number" ? payload.ms : undefined;
+    if (typeof ms === "number") {
+      return `waited ${ms}ms`;
+    }
+    return "waited";
+  }
+
+  if (name === "create_browser") {
+    const url = typeof payload.url === "string" ? payload.url : undefined;
+    if (url) {
+      return `opened browser at ${url}`;
+    }
+    return "opened browser";
+  }
+
+  if (name === "close_browser") {
+    return "closed browser";
+  }
+
+  if (name === "navigate") {
+    const url = typeof payload.url === "string" ? payload.url : undefined;
+    if (url) {
+      return `navigated to ${url}`;
+    }
+    return "navigated";
+  }
+
+  if (name === "reload") {
+    return "reloaded page";
+  }
+
+  if (name === "go_back") {
+    return "went back";
+  }
+
+  if (name === "go_forward") {
+    return "went forward";
+  }
+
+  if (name === "page_info") {
+    return "read page info";
+  }
+
+  if (name === "get_html") {
+    const htmlSelector = typeof payload.selector === "string" ? payload.selector : undefined;
+    if (htmlSelector) {
+      return `read html for ${htmlSelector}`;
+    }
+    return "read page html";
+  }
+
+  if (name === "get_text") {
+    const textSelector = typeof payload.selector === "string" ? payload.selector : undefined;
+    if (textSelector) {
+      return `read text for ${textSelector}`;
+    }
+    return "read page text";
+  }
+
+  if (name === "find") {
+    const findSelector = typeof payload.selector === "string" ? payload.selector : undefined;
+    const query = typeof payload.query === "string" ? payload.query : undefined;
+    if (findSelector) {
+      return `searched selector ${findSelector}`;
+    }
+    if (query) {
+      return `searched text "${query}"`;
+    }
+    return "searched page";
+  }
+
+  if (name === "list_links") {
+    return "listed links";
+  }
+
+  if (name === "screenshot") {
+    return "captured screenshot";
+  }
+
+  if (name === "hover") {
+    const hoverSelector = typeof payload.selector === "string" ? payload.selector : undefined;
+    if (hoverSelector) {
+      return `hovered ${hoverSelector}`;
+    }
+    return "hovered";
+  }
+
+  if (name === "press_key") {
+    const key = typeof payload.key === "string" ? payload.key : undefined;
+    if (key) {
+      return `pressed ${key}`;
+    }
+    return "pressed key";
+  }
+
+  return `${name} executed`;
+}
+
+function formatToolDetail(name: string, input: unknown, result: unknown): string {
+  const record = isRecord(result) ? result : {};
+  const status = typeof record.status === "string" ? record.status.toLowerCase() : "";
+  const note = typeof record.note === "string" ? simplifyToolNote(record.note) : "";
+  const payload = getToolPayload(input, result);
+  const data = isRecord(record.data) ? record.data : {};
+
+  const formatWithStatus = (value: string): string => {
+    const trimmed = value.trim();
+    if (status && status !== "ok") {
+      return trimmed ? `${status} - ${trimmed}` : status;
+    }
+    if (trimmed) {
+      return trimmed;
+    }
+    return note || status || "ok";
+  };
+
+  if (name === "install_pip") {
+    return formatWithStatus(formatInstallPipDetail(payload, record));
+  }
+
+  if (name === "run_py") {
+    return formatWithStatus(formatRunPyDetail(payload, record));
+  }
+
+  if (name === "run_py_module") {
+    return formatWithStatus(formatRunPyModuleDetail(payload, record));
+  }
+
+  if (name === "search_web") {
+    return formatWithStatus(formatSearchWebDetail(payload, record));
+  }
+
+  if (name === "type") {
+    const typedText = typeof payload.text === "string" ? payload.text.trim() : "";
+    if (typedText) {
+      return formatWithStatus(clipInline(typedText, 140));
+    }
+  }
+
+  if (name === "find") {
+    const count = typeof data.count === "number" ? data.count : undefined;
+    if (typeof count === "number") {
+      return formatWithStatus(`${count} match(es)`);
+    }
+  }
+
+  if (name === "list_links") {
+    const count = typeof data.count === "number" ? data.count : undefined;
+    if (typeof count === "number") {
+      return formatWithStatus(`${count} link(s)`);
+    }
+  }
+
+  if (name === "page_info") {
+    const title = typeof data.title === "string" ? data.title.trim() : "";
+    const url = typeof data.url === "string" ? data.url.trim() : "";
+    if (title && url) {
+      return formatWithStatus(`${clipInline(title, 70)} | ${clipInline(url, 90)}`);
+    }
+    if (title) {
+      return formatWithStatus(clipInline(title, 90));
+    }
+  }
+
+  if (name === "get_text") {
+    const text = typeof data.text === "string" ? data.text.trim() : "";
+    if (text) {
+      return formatWithStatus(clipInline(text, 140));
+    }
+  }
+
+  if (name === "get_html") {
+    const html = typeof data.html === "string" ? data.html.trim() : "";
+    if (html) {
+      return formatWithStatus(clipInline(html, 140));
+    }
+  }
+
+  if (name === "screenshot") {
+    const imagePath = typeof data.path === "string" ? data.path : "";
+    if (imagePath) {
+      return formatWithStatus(imagePath);
+    }
+  }
+
+  if (name === "navigate" || name === "create_browser") {
+    const currentUrl = typeof record.currentUrl === "string" ? record.currentUrl.trim() : "";
+    if (currentUrl) {
+      return formatWithStatus(currentUrl);
+    }
+  }
+
+  if (status && note) {
+    if (note.startsWith(status)) {
+      return note;
+    }
+    return `${status} - ${note}`;
+  }
+  if (note) {
+    return note;
+  }
+  if (status) {
+    return status;
+  }
+  if (typeof result === "string") {
+    return result;
+  }
+  return formatInlineJson(result);
+}
+
+function clipInline(value: string, maxLength: number): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (compact.length <= maxLength) {
+    return compact;
+  }
+  return `${compact.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function collapseRedundantSuccessDetail(summary: string, detail: string): string {
+  const trimmed = detail.trim();
+  if (!trimmed) {
+    return "ok";
+  }
+
+  if (trimmed.toLowerCase() === "ok") {
+    return "ok";
+  }
+
+  const parsed = parseStatusDetail(trimmed);
+  const status = parsed.status.toLowerCase();
+  const body = parsed.body;
+  if (status && status !== "ok") {
+    return trimmed;
+  }
+
+  const normalizedSummary = normalizeLogText(summary);
+  const normalizedBody = normalizeLogText(body);
+  if (!normalizedBody) {
+    return "ok";
+  }
+
+  if (isGenericSuccessBody(normalizedBody)) {
+    return "ok";
+  }
+
+  if (
+    normalizedSummary &&
+    (normalizedBody === normalizedSummary ||
+      normalizedBody.includes(normalizedSummary) ||
+      normalizedSummary.includes(normalizedBody))
+  ) {
+    return "ok";
+  }
+
+  return `ok - ${body}`;
+}
+
+function parseStatusDetail(value: string): { status: string; body: string } {
+  const match = value.match(/^([a-zA-Z_]+)\s*-\s*(.+)$/);
+  if (match) {
+    return {
+      status: match[1] ?? "",
+      body: (match[2] ?? "").trim(),
+    };
+  }
+  return {
+    status: "",
+    body: value.trim(),
+  };
+}
+
+function normalizeLogText(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function isGenericSuccessBody(value: string): boolean {
+  return (
+    value === "click completed" ||
+    value === "drag completed" ||
+    value === "scroll completed" ||
+    value === "typed text" ||
+    value === "waited" ||
+    value === "hovered" ||
+    value === "navigated" ||
+    value === "page reloaded" ||
+    value === "navigated back" ||
+    value === "navigated forward" ||
+    value === "closed browser session" ||
+    value === "opened browser"
+  );
+}
+
+function simplifyToolNote(note: string): string {
+  const normalized = note.trim().toLowerCase();
+  if (!normalized) {
+    return "";
+  }
+  if (normalized.includes("tool stub executed")) {
+    return "stub executed";
+  }
+  return normalized;
+}
+
+function getToolPayload(input: unknown, result: unknown): Record<string, unknown> {
+  if (isRecord(input)) {
+    return input;
+  }
+  const received = isRecord(result) ? result.received : undefined;
+  if (isRecord(received)) {
+    return received;
+  }
+  return {};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function getPythonPackages(payload: Record<string, unknown>, result: unknown): string[] {
+  const record = isRecord(result) ? result : {};
+  return toStringArray(record.packages ?? payload.packages);
+}
+
+function formatInstallPipDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
+  const packages = getPythonPackages(payload, record);
+  const packageSummary =
+    packages.length > 0
+      ? packages.length <= 3
+        ? packages.join(", ")
+        : `${packages.slice(0, 3).join(", ")}, +${packages.length - 3} more`
+      : "packages";
+
+  const outcome = summarizeInstallPipOutput(record);
+  if (outcome) {
+    const firstLine = outcome
+      .replace(/\r\n/g, "\n")
+      .split("\n")
+      .map((line) => line.trim())
+      .find(Boolean);
+    return firstLine ? `${packageSummary} | ${clipInline(firstLine, 140)}` : packageSummary;
+  }
+
+  return packageSummary;
+}
+
+function formatRunPyDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
+  const output = getCombinedProcessOutput(record);
+  if (output) {
+    const firstLine = output
+      .replace(/\r\n/g, "\n")
+      .split("\n")
+      .map((line) => line.trim())
+      .find(Boolean);
+    if (firstLine) {
+      return clipInline(firstLine, 180);
+    }
+  }
+  return "no stdout/stderr";
+}
+
+function formatRunPyModuleDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
+  const moduleName = readTrimmedString(record.module) || readTrimmedString(payload.module);
+  const modulePrefix = moduleName ? `${moduleName} | ` : "";
+
+  const output = getCombinedProcessOutput(record);
+  if (output) {
+    const firstLine = output
+      .replace(/\r\n/g, "\n")
+      .split("\n")
+      .map((line) => line.trim())
+      .find(Boolean);
+    if (firstLine) {
+      return `${modulePrefix}${clipInline(firstLine, 180)}`;
+    }
+  }
+  return `${modulePrefix}no stdout/stderr`.trim();
+}
+
+function formatSearchWebDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
+  const countRaw = typeof record.total_results === "number" ? record.total_results : undefined;
+  return typeof countRaw === "number" ? `${countRaw} result(s)` : "results";
+}
+
+function formatProcessCommand(record: Record<string, unknown>): string {
+  const command = readTrimmedString(record.command);
+  if (!command) {
+    return "";
+  }
+  const args = toStringArray(record.args);
+  const normalized = [command, ...args].map(quoteCommandToken).join(" ");
+  return `\`${normalized}\``;
+}
+
+function quoteCommandToken(value: string): string {
+  if (/^[a-zA-Z0-9_./:\\=-]+$/.test(value)) {
+    return value;
+  }
+  return JSON.stringify(value);
+}
+
+function formatDurationMs(value: unknown): string {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return "";
+  }
+  if (value < 1_000) {
+    return `${Math.round(value)}ms`;
+  }
+  const seconds = value / 1_000;
+  if (seconds < 60) {
+    return `${seconds.toFixed(seconds < 10 ? 2 : 1)}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remSeconds = seconds - minutes * 60;
+  return `${minutes}m ${remSeconds.toFixed(1)}s`;
+}
+
+function formatProcessOutputBlock(label: string, value: unknown, truncatedValue: unknown): string {
+  const text = readTrimmedString(value);
+  if (!text) {
+    return "";
+  }
+  const clipped = clipBlock(text, 60, 6_000);
+  const block = formatCodeBlock(label, clipped, "text");
+  return asBoolean(truncatedValue) ? `${block}\n(note: ${label} was truncated)` : block;
+}
+
+function getCombinedProcessOutput(record: Record<string, unknown>): string {
+  const stdout = readTrimmedString(record.stdout);
+  const stderr = readTrimmedString(record.stderr);
+  if (stdout && stderr) {
+    return `${stdout}\n\n[stderr]\n${stderr}`;
+  }
+  return stdout || stderr;
+}
+
+function summarizeInstallPipOutput(record: Record<string, unknown>): string {
+  const output = getCombinedProcessOutput(record);
+  if (!output) {
+    return "";
+  }
+  const lines = output
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const important = lines.filter((line) =>
+    /successfully installed|requirement already satisfied|no matching distribution found|could not find a version that satisfies|error:/i.test(
+      line,
+    ),
+  );
+  if (important.length > 0) {
+    return important.slice(0, 4).join("\n");
+  }
+  return lines.slice(0, 3).join("\n");
+}
+
+function formatCodeBlock(label: string, body: string, language: string): string {
+  const text = body.trim();
+  if (!text) {
+    return "";
+  }
+  const normalizedLanguage = language.trim().toLowerCase().replace(/[^a-z0-9_+-]/g, "");
+  const fence = normalizedLanguage ? `\`\`\`${normalizedLanguage}` : "```";
+  return `${label}:\n${fence}\n${text}\n\`\`\``;
+}
+
+function indentBlock(value: string, indent: string): string {
+  return value
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => `${indent}${line}`)
+    .join("\n");
+}
+
+function clipBlock(value: string, maxLines: number, maxChars: number): string {
+  const normalized = value.replace(/\r\n/g, "\n");
+  let text = normalized;
+  let truncated = false;
+
+  if (text.length > maxChars) {
+    text = text.slice(0, maxChars);
+    truncated = true;
+  }
+
+  let lines = text.split("\n");
+  const maxLineLength = 220;
+  lines = lines.map((line) => {
+    if (line.length <= maxLineLength) {
+      return line;
+    }
+    truncated = true;
+    return `${line.slice(0, maxLineLength - 3)}...`;
+  });
+
+  if (lines.length > maxLines) {
+    text = lines.slice(0, maxLines).join("\n");
+    truncated = true;
+  } else {
+    text = lines.join("\n");
+  }
+
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return "";
+  }
+  return truncated ? `${trimmed}\n...` : trimmed;
+}
+
+function toStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function readTrimmedString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function asBoolean(value: unknown): boolean {
+  return value === true;
+}
+
+function formatInlineJson(value: unknown): string {
+  const compact = safeJsonStringify(value).replace(/\s+/g, " ").trim();
+  if (compact.length > 240) {
+    return `${compact.slice(0, 237)}...`;
+  }
+  return compact;
+}
+
+function MessageRow({ message }: { message: UiMessage }) {
+  if (message.kind === "user") {
+    return (
+      <Box flexDirection="column" marginBottom={1}>
+        <Text color="blueBright">{GLYPH_USER}{message.text}</Text>
+      </Box>
+    );
+  }
+  if (message.kind === "assistant") {
+    return (
+      <Box flexDirection="column" marginBottom={1}>
+        <MarkdownText text={message.text} prefix={GLYPH_ASSISTANT} />
+      </Box>
+    );
+  }
+  return (
+    <Box flexDirection="column" marginBottom={1}>
+      <MarkdownText text={message.text} prefix={GLYPH_SYSTEM} />
+    </Box>
+  );
+}
+
+function parseThoughtTitle(rawThought: string): string {
+  const text = rawThought.trim();
+  if (!text) {
+    return "reasoning";
+  }
+
+  const titleMatch = text.match(/^\*\*(.+?)\*\*/s);
+  if (titleMatch?.[1]) {
+    return titleMatch[1].trim().toLowerCase();
+  }
+  const firstLine = text.split("\n")[0]?.trim();
+  return (firstLine || "reasoning").toLowerCase();
+}
+
+function resolveInitialOnboardingCompleted(persistedState: LoafPersistedState | null): boolean {
+  if (!persistedState) {
+    return false;
+  }
+  if (persistedState.onboardingCompleted === true) {
+    return true;
+  }
+  if (persistedState.onboardingCompleted === false) {
+    return false;
+  }
+  return true;
+}
+
+function buildOnboardingAuthOptions(enabledProviders: AuthProvider[]): OnboardingOption[] {
+  const hasOpenAi = enabledProviders.includes("openai");
+  const hasOpenRouter = enabledProviders.includes("openrouter");
+  return [
+    {
+      id: "auth_openai",
+      label: hasOpenAi ? "openai oauth (connected)" : "connect openai oauth",
+      description: "chatgpt account login for gpt models",
+    },
+    {
+      id: "auth_openrouter",
+      label: hasOpenRouter ? "openrouter api key (configured)" : "connect openrouter api key",
+      description: "openrouter models and provider routing",
+    },
+    {
+      id: "auth_continue",
+      label: "continue to exa setup",
+      description: "next step: configure exa search key",
+    },
+  ];
+}
+
+function resolveInitialEnabledProviders(params: {
+  persistedProviders: AuthProvider[] | undefined;
+  legacyProvider: AuthProvider | undefined;
+  hasOpenAiToken: boolean;
+  hasOpenRouterKey: boolean;
+}): AuthProvider[] {
+  const fromPersisted = dedupeAuthProviders(
+    params.persistedProviders ??
+      (params.legacyProvider ? [params.legacyProvider] : []),
+  );
+  if (fromPersisted.length > 0) {
+    return fromPersisted;
+  }
+
+  const inferred: AuthProvider[] = [];
+  if (params.hasOpenAiToken) {
+    inferred.push("openai");
+  }
+  if (params.hasOpenRouterKey) {
+    inferred.push("openrouter");
+  }
+  if (loafConfig.preferredAuthProvider === "openai" && params.hasOpenAiToken) {
+    inferred.unshift("openai");
+  }
+  if (loafConfig.preferredAuthProvider === "openrouter" && params.hasOpenRouterKey) {
+    inferred.unshift("openrouter");
+  }
+  return dedupeAuthProviders(inferred);
+}
+
+function resolveInitialModel(
+  providers: AuthProvider[],
+  candidate: string | undefined,
+  modelOptionsByProvider: Record<AuthProvider, ModelOption[]>,
+): string {
+  if (providers.length === 0) {
+    return "";
+  }
+
+  return resolveModelForEnabledProviders(providers, candidate, modelOptionsByProvider);
+}
+
+function resolveModelForEnabledProviders(
+  providers: AuthProvider[],
+  candidate: string | undefined,
+  modelOptionsByProvider: Record<AuthProvider, ModelOption[]>,
+): string {
+  const availableModels = getModelOptionsForProviders(providers, modelOptionsByProvider);
+  if (
+    candidate &&
+    availableModels.some((option) => option.id === candidate)
+  ) {
+    return candidate;
+  }
+
+  if (candidate) {
+    const inferredProvider = findProviderForModel(candidate, availableModels);
+    if (inferredProvider && providers.includes(inferredProvider)) {
+      // Preserve persisted/provider-valid model ids even before remote catalog hydration.
+      return candidate;
+    }
+  }
+
+  const preferredProvider =
+    loafConfig.preferredAuthProvider && providers.includes(loafConfig.preferredAuthProvider)
+      ? loafConfig.preferredAuthProvider
+      : providers[0];
+
+  if (preferredProvider) {
+    const providerModels = getModelOptionsForProvider(preferredProvider, modelOptionsByProvider);
+    const envModel = getEnvModelForProvider(preferredProvider);
+    if (providerModels.some((option) => option.id === envModel)) {
+      return envModel;
+    }
+    if (providerModels[0]?.id) {
+      return providerModels[0].id;
+    }
+  }
+
+  return availableModels[0]?.id ?? "";
+}
+
+function getEnvModelForProvider(provider: AuthProvider): string {
+  if (provider === "openai") {
+    return loafConfig.openaiModel.trim() || "gpt-4.1";
+  }
+  return loafConfig.openrouterModel.trim();
+}
+
+function getModelOptionsForProvider(
+  provider: AuthProvider,
+  modelOptionsByProvider: Record<AuthProvider, ModelOption[]>,
+): ModelOption[] {
+  const options = modelOptionsByProvider[provider];
+  if (options.length > 0) {
+    return options;
+  }
+  return getDefaultModelOptionsForProvider(provider);
+}
+
+function getModelOptionsForProviders(
+  providers: AuthProvider[],
+  modelOptionsByProvider: Record<AuthProvider, ModelOption[]>,
+): ModelOption[] {
+  const orderedProviders = AUTH_OPTIONS
+    .map((option) => option.id)
+    .filter((provider) => providers.includes(provider));
+
+  const combined: ModelOption[] = [];
+  for (const provider of orderedProviders) {
+    combined.push(...getModelOptionsForProvider(provider, modelOptionsByProvider));
+  }
+  return combined;
+}
+
+function findProviderForModel(
+  modelId: string,
+  availableModels: ModelOption[],
+): AuthProvider | null {
+  if (availableModels.length === 0) {
+    return null;
+  }
+
+  const direct = availableModels.find((option) => option.id === modelId)?.provider;
+  if (direct) {
+    return direct;
+  }
+
+  const normalized = modelIdToSlug(modelId).trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (
+    normalized.startsWith("gpt-") ||
+    normalized.startsWith("o1") ||
+    normalized.startsWith("o3") ||
+    normalized.startsWith("o4") ||
+    normalized.includes("codex")
+  ) {
+    return "openai";
+  }
+  if (normalized.includes("gemini") || normalized.includes("claude") || normalized.includes("/")) {
+    return "openrouter";
+  }
+  return null;
+}
+
+function dedupeAuthProviders(providers: AuthProvider[]): AuthProvider[] {
+  const ordered: AuthProvider[] = [];
+  for (const provider of providers) {
+    if ((provider !== "openai" && provider !== "openrouter") || ordered.includes(provider)) {
+      continue;
+    }
+    ordered.push(provider);
+  }
+  return ordered;
+}
+
+function resetConversationForProviderSwitch(params: {
+  fromProvider: AuthProvider | null;
+  toProvider: AuthProvider;
+  setHistory: React.Dispatch<React.SetStateAction<ChatMessage[]>>;
+  setMessages: React.Dispatch<React.SetStateAction<UiMessage[]>>;
+  nextMessageId: () => number;
+}): void {
+  params.setHistory([]);
+  const fromLabel = params.fromProvider ?? "unknown";
+  params.setMessages([
+    {
+      id: params.nextMessageId(),
+      kind: "system",
+      text: `provider switched: ${fromLabel} -> ${params.toProvider}. conversation context was reset.`,
+    },
+  ]);
+}
+
+function getThinkingOptionsForModel(
+  modelId: string,
+  provider: AuthProvider,
+  modelOptionsByProvider: Record<AuthProvider, ModelOption[]>,
+): ThinkingOption[] {
+  const modelOption = findModelOption(provider, modelId, modelOptionsByProvider);
+  if (modelOption?.supportedThinkingLevels && modelOption.supportedThinkingLevels.length > 0) {
+    return toThinkingOptions(modelOption.supportedThinkingLevels);
+  }
+
+  if (provider === "openai") {
+    return THINKING_OPTIONS_OPENAI_DEFAULT;
+  }
+  return THINKING_OPTIONS_OPENROUTER_DEFAULT;
+}
+
+function normalizeThinkingForModel(
+  modelId: string,
+  provider: AuthProvider | null,
+  thinking: ThinkingLevel,
+  modelOptionsByProvider: Record<AuthProvider, ModelOption[]>,
+): ThinkingLevel {
+  if (!provider) {
+    return thinking;
+  }
+
+  const thinkingOptions = getThinkingOptionsForModel(modelId, provider, modelOptionsByProvider);
+  const supportedLevels = thinkingOptions.map((option) => option.id as ThinkingLevel);
+  if (supportedLevels.includes(thinking)) {
+    return thinking;
+  }
+
+  const modelOption = findModelOption(provider, modelId, modelOptionsByProvider);
+  const defaultThinking = modelOption?.defaultThinkingLevel;
+  if (defaultThinking && supportedLevels.includes(defaultThinking)) {
+    return defaultThinking;
+  }
+
+  return supportedLevels[Math.floor(Math.max(0, (supportedLevels.length - 1) / 2))] ?? thinking;
+}
+
+function formatModelSummary(
+  provider: AuthProvider,
+  modelId: string,
+  thinkingLevel: string,
+  modelOptionsByProvider: Record<AuthProvider, ModelOption[]>,
+  openRouterProvider: string,
+): string {
+  const options = getModelOptionsForProvider(provider, modelOptionsByProvider);
+  const label = options.find((option) => option.id === modelId)?.label || modelIdToLabel(modelId);
+  if (provider === "openrouter") {
+    return `${provider} - ${label.toLowerCase()} (${thinkingLevel.toLowerCase()}, provider: ${normalizeOpenRouterProviderSelection(openRouterProvider)})`;
+  }
+  return `${provider} - ${label.toLowerCase()} (${thinkingLevel.toLowerCase()})`;
+}
+
+function findModelOption(
+  provider: AuthProvider,
+  modelId: string,
+  modelOptionsByProvider: Record<AuthProvider, ModelOption[]>,
+): ModelOption | undefined {
+  return getModelOptionsForProvider(provider, modelOptionsByProvider).find((option) => option.id === modelId);
+}
+
+function normalizeOpenRouterProviderSelection(value: string | undefined | null): string {
+  const normalized = (value ?? "").trim().toLowerCase();
+  if (!normalized) {
+    return OPENROUTER_PROVIDER_ANY_ID;
+  }
+  return normalized;
+}
+
+function getOpenRouterProviderOptions(
+  modelId: string,
+  modelOptionsByProvider: Record<AuthProvider, ModelOption[]>,
+  overrideProviders?: string[],
+): OpenRouterProviderOption[] {
+  const modelOption = findModelOption("openrouter", modelId, modelOptionsByProvider);
+  const providerTags = (overrideProviders ?? modelOption?.routingProviders ?? [])
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+  const dedupedProviderTags = Array.from(new Set(providerTags)).sort((a, b) => a.localeCompare(b));
+
+  const options: OpenRouterProviderOption[] = [
+    {
+      id: OPENROUTER_PROVIDER_ANY_ID,
+      label: "any",
+      description: "let openrouter auto-route and fallback",
+    },
+  ];
+
+  for (const providerTag of dedupedProviderTags) {
+    options.push({
+      id: providerTag,
+      label: providerTag,
+      description: `force provider ${providerTag}`,
+    });
+  }
+
+  return options;
+}
+
+function toThinkingOptions(levels: ThinkingLevel[]): ThinkingOption[] {
+  const deduped: ThinkingLevel[] = [];
+  for (const level of levels) {
+    if (!deduped.includes(level)) {
+      deduped.push(level);
+    }
+  }
+  return deduped.map((level) => ({
+    id: level,
+    label: THINKING_OPTION_DETAILS[level].label,
+    description: THINKING_OPTION_DETAILS[level].description,
+  }));
+}
+
+function MarkdownText({ text, prefix = "" }: { text: string; prefix?: string }) {
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  let usedPrefix = false;
+  let inCodeBlock = false;
+  let codeBlockLanguage = "";
+
+  return (
+    <Box flexDirection="column">
+      {lines.map((line, index) => {
+        const trimmed = line.trim();
+        const linePrefix =
+          trimmed.length > 0
+            ? !usedPrefix
+              ? prefix
+              : " ".repeat(prefix.length)
+            : "";
+        if (trimmed.length > 0) {
+          usedPrefix = true;
+        }
+
+        if (/^```/.test(trimmed)) {
+          if (!inCodeBlock) {
+            codeBlockLanguage = trimmed.replace(/^```+/, "").trim().toLowerCase();
+            inCodeBlock = true;
+          } else {
+            inCodeBlock = false;
+            codeBlockLanguage = "";
+          }
+          return null;
+        }
+
+        if (inCodeBlock) {
+          const codeColor = codeBlockLanguage === "text" ? "gray" : "yellow";
+          return (
+            <Text key={`line-${index}`} color={codeColor}>
+              {linePrefix}
+              {line}
+            </Text>
+          );
+        }
+
+        if (!trimmed) {
+          return <Text key={`line-${index}`}> </Text>;
+        }
+
+        if (/^---+$/.test(trimmed)) {
+          return (
+            <Text key={`line-${index}`} color="gray">
+              {linePrefix}
+              {"-".repeat(40)}
+            </Text>
+          );
+        }
+
+        const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
+        if (headingMatch) {
+          return (
+            <Text key={`line-${index}`} color="cyanBright" bold>
+              {linePrefix}
+              {renderInlineMarkdown(headingMatch[2], `h-${index}`)}
+            </Text>
+          );
+        }
+
+        const bulletMatch = line.match(/^(\s*)[-*]\s+(.+)$/);
+        if (bulletMatch) {
+          return (
+            <Text key={`line-${index}`} color="white">
+              {linePrefix}
+              {" ".repeat(bulletMatch[1]?.length ?? 0)}* {renderInlineMarkdown(bulletMatch[2], `b-${index}`)}
+            </Text>
+          );
+        }
+
+        const quoteMatch = line.match(/^\s*>\s+(.+)$/);
+        if (quoteMatch) {
+          return (
+            <Text key={`line-${index}`} color="gray">
+              {linePrefix}
+              | {renderInlineMarkdown(quoteMatch[1], `q-${index}`)}
+            </Text>
+          );
+        }
+
+        return (
+          <Text key={`line-${index}`} color="white">
+            {linePrefix}
+            {renderInlineMarkdown(line, `p-${index}`)}
+          </Text>
+        );
+      })}
+    </Box>
+  );
+}
+
+function renderInlineMarkdown(input: string, keyPrefix: string): React.ReactNode[] {
+  const text = normalizeInlineMarkdown(input);
+  const tokens = text.split(/(\*\*[^*]+\*\*|`[^`]+`|\*[^*]+\*)/g);
+
+  const nodes: React.ReactNode[] = [];
+  let index = 0;
+  for (const token of tokens) {
+    if (!token) {
+      continue;
+    }
+
+    if (token.startsWith("**") && token.endsWith("**")) {
+      nodes.push(
+        <Text key={`${keyPrefix}-${index++}`} bold>
+          {token.slice(2, -2)}
+        </Text>,
+      );
+      continue;
+    }
+
+    if (token.startsWith("`") && token.endsWith("`")) {
+      nodes.push(
+        <Text key={`${keyPrefix}-${index++}`} color="yellow">
+          {token.slice(1, -1)}
+        </Text>,
+      );
+      continue;
+    }
+
+    if (token.startsWith("*") && token.endsWith("*")) {
+      nodes.push(
+        <Text key={`${keyPrefix}-${index++}`} italic>
+          {token.slice(1, -1)}
+        </Text>,
+      );
+      continue;
+    }
+
+    nodes.push(<Text key={`${keyPrefix}-${index++}`}>{token}</Text>);
+  }
+
+  return nodes;
+}
+
+function normalizeInlineMarkdown(input: string): string {
+  const withoutLinks = input.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1 ($2)");
+  return withoutLinks;
+}
+
+function buildRuntimeSystemInstruction(params: {
+  baseInstruction: string;
+  hasExaSearch: boolean;
+}): string {
+  const base = params.baseInstruction.trim();
+  if (!params.hasExaSearch) {
+    return base;
+  }
+
+  if (base.toLowerCase().includes("search_web")) {
+    return base;
+  }
+
+  return `${base}\n${SEARCH_WEB_PROMPT_EXTENSION}`.trim();
+}
+
+void startApp();
+
+async function startApp(): Promise<void> {
+  try {
+    const runtime = await ensurePythonRuntime();
+    const setupNotes: string[] = [];
+    if (runtime.installedByBootstrap) {
+      setupNotes.push("python installed");
+    }
+    if (runtime.createdVenv) {
+      setupNotes.push("venv created");
+    }
+    const suffix = setupNotes.length > 0 ? ` (${setupNotes.join(", ")})` : "";
+    console.log(`[loaf] python runtime ready: ${runtime.pythonExecutable}${suffix}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[loaf] python bootstrap failed: ${message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  render(<App />);
+}
+
+
