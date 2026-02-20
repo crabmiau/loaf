@@ -121,7 +121,6 @@ export async function runOpenRouterInferenceStream(
     },
   });
 
-  const toolDeclarations = buildToolDeclarations();
   const startedAt = Date.now();
   let toolRound = 0;
   const systemInstruction = request.systemInstruction?.trim() || loafConfig.systemInstruction;
@@ -161,6 +160,7 @@ export async function runOpenRouterInferenceStream(
     }
 
     toolRound += 1;
+    const toolDeclarations = buildToolDeclarations();
 
     const requestPayload: Record<string, unknown> = {
       model: request.model,

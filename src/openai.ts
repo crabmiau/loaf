@@ -134,7 +134,6 @@ export async function runOpenAiInferenceStream(
   const client = createChatgptCodexClient(accessToken, request.chatgptAccountId);
   const systemInstruction = request.systemInstruction?.trim() || loafConfig.systemInstruction;
 
-  const toolDeclarations = buildToolDeclarations();
   let conversationInput = messagesToResponsesInput(request.messages);
   const startedAt = Date.now();
   let toolRound = 0;
@@ -158,6 +157,7 @@ export async function runOpenAiInferenceStream(
     }
 
     toolRound += 1;
+    const toolDeclarations = buildToolDeclarations();
     const requestPayload: Record<string, unknown> = {
       model: request.model,
       instructions: systemInstruction,

@@ -471,14 +471,6 @@ function App() {
       role: "user",
       text,
     });
-    setMessages((current) => [
-      ...current,
-      {
-        id: nextMessageId(),
-        kind: "user",
-        text,
-      },
-    ]);
     setInput("");
     setStatusLabel("steer queued...");
     return true;
@@ -1548,6 +1540,7 @@ function App() {
     setMessages((current) => [...current, nextUserMessage]);
 
     let assistantDraftText = "";
+    const appliedSteeringMessages: ChatMessage[] = [];
 
     const appendAssistantDraftDelta = (deltaText: string) => {
       if (!deltaText) {
@@ -1562,6 +1555,15 @@ function App() {
         return [];
       }
       steeringQueueRef.current = [];
+      appliedSteeringMessages.push(...queued);
+      setMessages((current) => [
+        ...current,
+        ...queued.map((message) => ({
+          id: nextMessageId(),
+          kind: "user" as const,
+          text: message.text,
+        })),
+      ]);
       setStatusLabel("steer applied; continuing...");
       return queued;
     };
@@ -1629,7 +1631,7 @@ function App() {
         role: "assistant",
         text: result.answer,
       };
-      const savedHistory = [...nextHistory, assistantMessage];
+      const savedHistory = [...nextHistory, ...appliedSteeringMessages, assistantMessage];
       setHistory(savedHistory);
       setConversationProvider(provider);
 
@@ -1663,9 +1665,10 @@ function App() {
     } catch (error) {
       if (isAbortError(error)) {
         const interruptedAssistant = assistantDraftText.trim();
+        const interruptedHistoryBase = [...nextHistory, ...appliedSteeringMessages];
         const interruptedHistory = interruptedAssistant
-          ? [...nextHistory, { role: "assistant" as const, text: interruptedAssistant }]
-          : nextHistory;
+          ? [...interruptedHistoryBase, { role: "assistant" as const, text: interruptedAssistant }]
+          : interruptedHistoryBase;
         setHistory(interruptedHistory);
         setConversationProvider(provider);
 
@@ -1903,10 +1906,11 @@ function App() {
 
 function parseSteerCommand(rawInput: string): string | null {
   const trimmed = rawInput.trim();
-  if (!trimmed.toLowerCase().startsWith("/steer")) {
+  const match = trimmed.match(/^\/steer(?:\s+([\s\S]+))?$/i);
+  if (!match) {
     return null;
   }
-  const payload = trimmed.slice("/steer".length).trim();
+  const payload = (match[1] ?? "").trim();
   return payload || null;
 }
 
