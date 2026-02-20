@@ -10,6 +10,8 @@ const DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_PORT = 1455;
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_ORIGINATOR = "codex_cli_rs";
+const DEFAULT_DEVICE_CODE_INTERVAL_SECONDS = 5;
+const DEFAULT_DEVICE_CODE_EXPIRY_SECONDS = 15 * 60;
 
 type OpenAiTokenBundle = {
   id_token: string;
@@ -44,12 +46,22 @@ export type OpenAiOauthLoginOptions = {
   timeoutMs?: number;
   openBrowser?: boolean;
   originator?: string;
+  mode?: "auto" | "browser" | "device_code";
+  onDeviceCode?: (info: OpenAiDeviceCodeInfo) => void;
 };
 
 export type OpenAiOauthLoginResult = {
   authUrl: string;
   authFilePath: string;
   chatgptAuth: OpenAiChatgptAuth;
+  loginMethod: "browser" | "device_code";
+};
+
+export type OpenAiDeviceCodeInfo = {
+  verificationUrl: string;
+  userCode: string;
+  intervalSeconds: number;
+  expiresInSeconds: number;
 };
 
 export function getOpenAiAuthFilePath(): string {
@@ -127,10 +139,34 @@ export async function runOpenAiOauthLogin(
   const issuer = (options.issuer ?? DEFAULT_ISSUER).replace(/\/+$/, "");
   const clientId = options.clientId ?? DEFAULT_CLIENT_ID;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const openBrowser = options.openBrowser !== false;
+  const mode = options.mode ?? "auto";
+  const openBrowser = options.openBrowser ?? !isLikelyHeadlessEnvironment();
   const originator = resolveOriginator(options.originator);
-  const { server, port } = await listenWithFallback(options.port ?? DEFAULT_PORT);
+  const shouldUseDeviceCode = mode === "device_code" || (mode === "auto" && isLikelyHeadlessEnvironment());
 
+  if (shouldUseDeviceCode) {
+    try {
+      const result = await runOpenAiDeviceCodeLogin({
+        issuer,
+        clientId,
+        timeoutMs,
+        openBrowser,
+        onDeviceCode: options.onDeviceCode,
+      });
+      return {
+        authUrl: result.deviceCode.verificationUrl,
+        authFilePath: result.authFilePath,
+        chatgptAuth: result.chatgptAuth,
+        loginMethod: "device_code",
+      };
+    } catch (error) {
+      if (!(mode === "auto" && isDeviceCodeUnsupportedError(error))) {
+        throw error;
+      }
+    }
+  }
+
+  const { server, port } = await listenWithFallback(options.port ?? DEFAULT_PORT);
   const pkce = generatePkce();
   const state = randomBase64Url(32);
   const redirectUri = `http://localhost:${port}/auth/callback`;
@@ -149,8 +185,8 @@ export async function runOpenAiOauthLogin(
 
   const result = await waitForOAuthCompletion({
     server,
-    issuer,
     clientId,
+    tokenEndpoint: `${issuer}/oauth/token`,
     state,
     redirectUri,
     codeVerifier: pkce.codeVerifier,
@@ -161,6 +197,7 @@ export async function runOpenAiOauthLogin(
     authUrl,
     authFilePath: result.authFilePath,
     chatgptAuth: result.chatgptAuth,
+    loginMethod: "browser",
   };
 }
 
@@ -212,6 +249,224 @@ function resolveOriginator(candidate: string | undefined): string {
   return DEFAULT_ORIGINATOR;
 }
 
+export function isLikelyHeadlessEnvironment(): boolean {
+  if (hasNonEmptyEnv("CI") || hasNonEmptyEnv("SSH_CONNECTION") || hasNonEmptyEnv("SSH_CLIENT") || hasNonEmptyEnv("SSH_TTY")) {
+    return true;
+  }
+
+  if (process.platform === "linux" && !hasNonEmptyEnv("DISPLAY") && !hasNonEmptyEnv("WAYLAND_DISPLAY")) {
+    return true;
+  }
+
+  return false;
+}
+
+function hasNonEmptyEnv(key: string): boolean {
+  const value = process.env[key];
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+class DeviceCodeUnsupportedError extends Error {}
+
+function isDeviceCodeUnsupportedError(error: unknown): boolean {
+  return error instanceof DeviceCodeUnsupportedError;
+}
+
+async function runOpenAiDeviceCodeLogin(options: {
+  issuer: string;
+  clientId: string;
+  timeoutMs: number;
+  openBrowser: boolean;
+  onDeviceCode?: (info: OpenAiDeviceCodeInfo) => void;
+}): Promise<{ authFilePath: string; chatgptAuth: OpenAiChatgptAuth; deviceCode: OpenAiDeviceCodeInfo }> {
+  const deviceCode = await requestOpenAiDeviceCode(options.issuer, options.clientId);
+  options.onDeviceCode?.({
+    verificationUrl: deviceCode.verificationUrl,
+    userCode: deviceCode.userCode,
+    intervalSeconds: deviceCode.intervalSeconds,
+    expiresInSeconds: deviceCode.expiresInSeconds,
+  });
+
+  if (options.openBrowser) {
+    openExternalUrl(deviceCode.verificationUrl);
+  }
+
+  const authorization = await waitForOpenAiDeviceAuthorization({
+    issuer: options.issuer,
+    deviceAuthId: deviceCode.deviceAuthId,
+    userCode: deviceCode.userCode,
+    intervalSeconds: deviceCode.intervalSeconds,
+    timeoutMs: options.timeoutMs,
+  });
+
+  const tokens = await exchangeAuthorizationCode({
+    tokenEndpoint: `${options.issuer}/oauth/token`,
+    clientId: options.clientId,
+    redirectUri: `${options.issuer}/deviceauth/callback`,
+    codeVerifier: authorization.codeVerifier,
+    code: authorization.authorizationCode,
+  });
+
+  let apiKey: string | undefined;
+  try {
+    apiKey = await exchangeIdTokenForApiKey({
+      tokenEndpoint: `${options.issuer}/oauth/token`,
+      clientId: options.clientId,
+      idToken: tokens.id_token,
+    });
+  } catch {
+    // Keep ChatGPT-account auth usable even if API key exchange is unavailable.
+  }
+
+  const accountId = readChatGptAccountId(tokens.id_token);
+  const authFilePath = persistOpenAiAuth({
+    apiKey,
+    accountId,
+    idToken: tokens.id_token,
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token,
+  });
+
+  return {
+    authFilePath,
+    chatgptAuth: {
+      accessToken: tokens.access_token,
+      accountId,
+      refreshToken: tokens.refresh_token,
+      idToken: tokens.id_token,
+      apiKey,
+    },
+    deviceCode: {
+      verificationUrl: deviceCode.verificationUrl,
+      userCode: deviceCode.userCode,
+      intervalSeconds: deviceCode.intervalSeconds,
+      expiresInSeconds: deviceCode.expiresInSeconds,
+    },
+  };
+}
+
+type OpenAiDeviceCodeState = {
+  deviceAuthId: string;
+  userCode: string;
+  verificationUrl: string;
+  intervalSeconds: number;
+  expiresInSeconds: number;
+};
+
+async function requestOpenAiDeviceCode(issuer: string, clientId: string): Promise<OpenAiDeviceCodeState> {
+  const response = await fetch(`${issuer}/api/accounts/deviceauth/usercode`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      client_id: clientId,
+    }),
+  });
+
+  if (!response.ok) {
+    if (response.status === 404) {
+      throw new DeviceCodeUnsupportedError("Device code login is not enabled for this OAuth issuer.");
+    }
+
+    const text = await response.text();
+    throw new Error(`Device code request failed (${response.status}): ${summarizeHttpError(text)}`);
+  }
+
+  const payload = (await response.json()) as Partial<{
+    device_auth_id: string;
+    user_code: string;
+    usercode: string;
+    interval: string | number;
+    expires_in: string | number;
+  }>;
+  const deviceAuthId = payload.device_auth_id?.trim();
+  const userCode = (payload.user_code ?? payload.usercode ?? "").trim();
+  if (!deviceAuthId || !userCode) {
+    throw new Error("Device code request returned an incomplete payload.");
+  }
+
+  return {
+    deviceAuthId,
+    userCode,
+    verificationUrl: `${issuer}/codex/device`,
+    intervalSeconds: parsePositiveInteger(payload.interval, DEFAULT_DEVICE_CODE_INTERVAL_SECONDS),
+    expiresInSeconds: parsePositiveInteger(payload.expires_in, DEFAULT_DEVICE_CODE_EXPIRY_SECONDS),
+  };
+}
+
+async function waitForOpenAiDeviceAuthorization(options: {
+  issuer: string;
+  deviceAuthId: string;
+  userCode: string;
+  intervalSeconds: number;
+  timeoutMs: number;
+}): Promise<{ authorizationCode: string; codeVerifier: string }> {
+  const startedAt = Date.now();
+  const pollIntervalMs = Math.max(1, options.intervalSeconds) * 1000;
+  while (Date.now() - startedAt < options.timeoutMs) {
+    const response = await fetch(`${options.issuer}/api/accounts/deviceauth/token`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        device_auth_id: options.deviceAuthId,
+        user_code: options.userCode,
+      }),
+    });
+
+    if (response.ok) {
+      const payload = (await response.json()) as Partial<{
+        authorization_code: string;
+        code_verifier: string;
+      }>;
+      const authorizationCode = payload.authorization_code?.trim();
+      const codeVerifier = payload.code_verifier?.trim();
+      if (!authorizationCode || !codeVerifier) {
+        throw new Error("Device code poll returned an incomplete authorization payload.");
+      }
+      return {
+        authorizationCode,
+        codeVerifier,
+      };
+    }
+
+    if (response.status !== 403 && response.status !== 404) {
+      const text = await response.text();
+      throw new Error(`Device code poll failed (${response.status}): ${summarizeHttpError(text)}`);
+    }
+
+    const elapsedMs = Date.now() - startedAt;
+    const remainingMs = options.timeoutMs - elapsedMs;
+    if (remainingMs <= 0) {
+      break;
+    }
+    await sleep(Math.min(pollIntervalMs, remainingMs));
+  }
+
+  throw new Error("OAuth device login timed out after 15 minutes.");
+}
+
+function parsePositiveInteger(value: string | number | undefined, fallback: number): number {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return Math.floor(value);
+  }
+  if (typeof value === "string") {
+    const parsed = Number.parseInt(value.trim(), 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return fallback;
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 async function listenWithFallback(requestedPort: number): Promise<{ server: http.Server; port: number }> {
   try {
     return await listenOnPort(requestedPort);
@@ -248,8 +503,8 @@ async function listenOnPort(port: number): Promise<{ server: http.Server; port: 
 
 async function waitForOAuthCompletion(options: {
   server: http.Server;
-  issuer: string;
   clientId: string;
+  tokenEndpoint: string;
   state: string;
   redirectUri: string;
   codeVerifier: string;
@@ -323,8 +578,8 @@ async function waitForOAuthCompletion(options: {
 
 async function handleOAuthRequest(
   options: {
-    issuer: string;
     clientId: string;
+    tokenEndpoint: string;
     state: string;
     redirectUri: string;
     codeVerifier: string;
@@ -363,7 +618,7 @@ async function handleOAuthRequest(
   }
 
   const tokens = await exchangeAuthorizationCode({
-    issuer: options.issuer,
+    tokenEndpoint: options.tokenEndpoint,
     clientId: options.clientId,
     redirectUri: options.redirectUri,
     codeVerifier: options.codeVerifier,
@@ -373,7 +628,7 @@ async function handleOAuthRequest(
   let apiKey: string | undefined;
   try {
     apiKey = await exchangeIdTokenForApiKey({
-      issuer: options.issuer,
+      tokenEndpoint: options.tokenEndpoint,
       clientId: options.clientId,
       idToken: tokens.id_token,
     });
@@ -408,7 +663,7 @@ async function handleOAuthRequest(
 }
 
 async function exchangeAuthorizationCode(params: {
-  issuer: string;
+  tokenEndpoint: string;
   clientId: string;
   redirectUri: string;
   codeVerifier: string;
@@ -422,7 +677,7 @@ async function exchangeAuthorizationCode(params: {
     code_verifier: params.codeVerifier,
   });
 
-  const response = await fetch(`${params.issuer}/oauth/token`, {
+  const response = await fetch(params.tokenEndpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
@@ -448,7 +703,7 @@ async function exchangeAuthorizationCode(params: {
 }
 
 async function exchangeIdTokenForApiKey(params: {
-  issuer: string;
+  tokenEndpoint: string;
   clientId: string;
   idToken: string;
 }): Promise<string> {
@@ -460,7 +715,7 @@ async function exchangeIdTokenForApiKey(params: {
     subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
   });
 
-  const response = await fetch(`${params.issuer}/oauth/token`, {
+  const response = await fetch(params.tokenEndpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
