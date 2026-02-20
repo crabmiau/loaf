@@ -14,7 +14,9 @@ export type OpenAIRequest = {
 };
 
 const CHATGPT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
-const OPENAI_MODELS_CLIENT_VERSION = "0.1.0";
+// Use a high advertised client version so server-side model gating does not hide newer catalog entries.
+// Override via OPENAI_MODELS_CLIENT_VERSION when needed for debugging/compatibility.
+const OPENAI_MODELS_CLIENT_VERSION = resolveOpenAiModelsClientVersion();
 const OPENAI_MODELS_ORIGINATOR = "codex_cli_rs";
 const MAX_429_RETRY_ATTEMPTS = 8;
 const RETRY_BASE_DELAY_MS = 1_250;
@@ -40,6 +42,15 @@ type OpenAiResponse = {
     }>;
   }>;
 };
+
+function resolveOpenAiModelsClientVersion(): string {
+  const fromEnv = process.env.OPENAI_MODELS_CLIENT_VERSION?.trim();
+  if (fromEnv) {
+    return fromEnv;
+  }
+
+  return "999.0.0";
+}
 
 export type OpenAiCatalogModel = {
   id: string;
@@ -67,7 +78,7 @@ export function createChatgptCodexClient(
   }
 
   const defaultHeaders: Record<string, string> = {
-    version: "0.1.0",
+    version: OPENAI_MODELS_CLIENT_VERSION,
     originator: OPENAI_MODELS_ORIGINATOR,
   };
   const accountId = chatgptAccountId?.trim();
@@ -599,7 +610,11 @@ function parseOpenAiCatalogModels(payload: unknown): OpenAiCatalogModel[] {
     for (const item of records.models) {
       const row = item as Record<string, unknown>;
       const id = normalizeCatalogId(
-        typeof row.slug === "string" ? row.slug : undefined,
+        typeof row.slug === "string"
+          ? row.slug
+          : typeof row.id === "string"
+            ? row.id
+            : undefined,
       );
       if (!id) {
         continue;

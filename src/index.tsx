@@ -154,6 +154,8 @@ const COMMAND_OPTIONS: CommandOption[] = [
   { name: "/model", description: "choose model and thinking level" },
   { name: "/tools", description: "list registered tools" },
   { name: "/clear", description: "clear conversation messages" },
+  { name: "/quit", description: "quit loaf" },
+  { name: "/exit", description: "quit loaf" },
   { name: "/help", description: "show available commands" },
 ];
 
@@ -743,6 +745,11 @@ function App() {
       setMessages([]);
       setHistory([]);
       setConversationProvider(null);
+      return;
+    }
+
+    if (command === "/quit" || command === "/exit") {
+      exit();
       return;
     }
 
@@ -1425,7 +1432,7 @@ function App() {
           showCursor
         />
       </Box>
-      <Text color="gray">ctrl+c exit | /help for commands</Text>
+      <Text color="gray">ctrl+c exit | /quit | /help</Text>
     </Box>
   );
 }
@@ -2629,7 +2636,5 @@ async function startApp(): Promise<void> {
     return;
   }
 
-  render(<App />);
+render(<App />);
 }
-
-
