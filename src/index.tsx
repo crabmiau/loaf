@@ -160,7 +160,8 @@ const COMMAND_OPTIONS: CommandOption[] = [
 const SUPER_DEBUG_COMMAND = "/superdebug-69";
 const MAX_INPUT_HISTORY = 200;
 const MAX_VISIBLE_MESSAGES = 14;
-const GLYPH_USER = "\u2937 ";
+// Keep user prefix ASCII to avoid terminal width ambiguity clipping tail characters.
+const GLYPH_USER = "> ";
 const GLYPH_ASSISTANT = "\u27E3 ";
 const GLYPH_SYSTEM = "\u2301 ";
 const SEARCH_WEB_PROMPT_EXTENSION = [
