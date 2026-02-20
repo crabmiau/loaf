@@ -2326,6 +2326,7 @@ function formatToolRows(data: unknown): string[] {
 function shouldCollapseSuccessDetail(name: string): boolean {
   return (
     name !== "create_persistent_tool" &&
+    name !== "bash" &&
     name !== "install_js_packages" &&
     name !== "run_js" &&
     name !== "run_js_module" &&
@@ -2357,6 +2358,14 @@ function formatToolSummary(name: string, input: unknown, result: unknown): strin
 
   if (name === "run_js") {
     return "executed javascript script";
+  }
+
+  if (name === "bash") {
+    const command = readTrimmedString(payload.command);
+    if (command) {
+      return `ran shell command "${clipInline(command, 72)}"`;
+    }
+    return "ran shell command";
   }
 
   if (name === "run_js_module") {
@@ -2426,6 +2435,10 @@ function formatToolDetail(name: string, input: unknown, result: unknown): string
 
   if (name === "run_js") {
     return formatWithStatus(formatRunJsDetail(payload, record));
+  }
+
+  if (name === "bash") {
+    return formatWithStatus(formatBashDetail(payload, record));
   }
 
   if (name === "run_js_module") {
@@ -2667,6 +2680,27 @@ function formatRunJsModuleDetail(payload: Record<string, unknown>, record: Recor
     }
   }
   return `${modulePrefix}no stdout/stderr`.trim();
+}
+
+function formatBashDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
+  const command = readTrimmedString(payload.command);
+  const output = getCombinedProcessOutput(record);
+  const cwdAfter = readTrimmedString(record.cwd_after);
+
+  const commandPrefix = command ? `${clipInline(command, 120)} | ` : "";
+  const cwdSuffix = cwdAfter ? ` | cwd: ${clipInline(cwdAfter, 80)}` : "";
+
+  if (output) {
+    const firstLine = output
+      .replace(/\r\n/g, "\n")
+      .split("\n")
+      .map((line) => line.trim())
+      .find(Boolean);
+    if (firstLine) {
+      return `${commandPrefix}${clipInline(firstLine, 160)}${cwdSuffix}`.trim();
+    }
+  }
+  return `${commandPrefix}no stdout/stderr${cwdSuffix}`.trim();
 }
 
 function formatSearchWebDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {

@@ -748,7 +748,11 @@ function parseOpenAiCatalogModels(payload: unknown): OpenAiCatalogModel[] {
     for (const item of records.models) {
       const row = item as Record<string, unknown>;
       const id = normalizeCatalogId(
-        typeof row.slug === "string" ? row.slug : undefined,
+        typeof row.slug === "string"
+          ? row.slug
+          : typeof row.id === "string"
+            ? row.id
+            : undefined,
       );
       if (!id) {
         continue;

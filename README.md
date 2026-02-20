@@ -18,7 +18,8 @@ a terminal-first ai assistant cli built with ink + react.
   - searchable model picker
   - thinking level picker
   - openrouter provider routing picker (`any` + forced providers when available)
-- javascript-first tool runtime:
+- local command + javascript tool runtime:
+  - `bash`
   - `run_js`
   - `install_js_packages`
   - `run_js_module`
