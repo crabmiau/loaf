@@ -57,6 +57,12 @@ type OpenRouterProviderOption = {
   description: string;
 };
 
+type ProviderSwitchConfirmOption = {
+  id: "switch_confirm" | "switch_cancel";
+  label: string;
+  description: string;
+};
+
 type CommandOption = {
   name: string;
   description: string;
@@ -129,6 +135,17 @@ type SelectorState =
       title: string;
       index: number;
       options: HistoryOption[];
+    }
+  | {
+      kind: "provider_switch_confirm";
+      title: string;
+      index: number;
+      options: ProviderSwitchConfirmOption[];
+      modelId: string;
+      modelLabel: string;
+      modelProvider: AuthProvider;
+      thinkingLevel: ThinkingLevel;
+      openRouterProvider?: string;
     };
 
 const AUTH_OPTIONS: AuthOption[] = [
@@ -635,7 +652,13 @@ function App() {
   const getSelectorAllOptions = (
     currentSelector: SelectorState,
   ): Array<
-    AuthOption | ModelOption | ThinkingOption | OpenRouterProviderOption | OnboardingOption | HistoryOption
+    | AuthOption
+    | ModelOption
+    | ThinkingOption
+    | OpenRouterProviderOption
+    | OnboardingOption
+    | HistoryOption
+    | ProviderSwitchConfirmOption
   > => {
     if (currentSelector.kind === "openrouter_api_key" || currentSelector.kind === "exa_api_key") {
       return [];
@@ -648,7 +671,13 @@ function App() {
 
   const getSelectorOptionWindow = (
     options: Array<
-      AuthOption | ModelOption | ThinkingOption | OpenRouterProviderOption | OnboardingOption | HistoryOption
+      | AuthOption
+      | ModelOption
+      | ThinkingOption
+      | OpenRouterProviderOption
+      | OnboardingOption
+      | HistoryOption
+      | ProviderSwitchConfirmOption
     >,
     index: number,
   ) => {
@@ -678,9 +707,40 @@ function App() {
     modelProvider: AuthProvider;
     thinkingLevel: ThinkingLevel;
     openRouterProvider?: string;
+    bypassProviderSwitchWarning?: boolean;
   }) => {
     const providerChanged =
       selectedModelProvider !== null && selectedModelProvider !== params.modelProvider;
+    const hasContextToLose = history.length > 0;
+
+    if (providerChanged && hasContextToLose && !params.bypassProviderSwitchWarning) {
+      const fromProvider = selectedModelProvider ?? "unknown";
+      const switchOptions: ProviderSwitchConfirmOption[] = [
+        {
+          id: "switch_confirm",
+          label: "switch and clear context",
+          description: "continue with the new provider and clear current conversation context",
+        },
+        {
+          id: "switch_cancel",
+          label: "cancel",
+          description: "keep current provider and current context",
+        },
+      ];
+      setInput("");
+      setSelector({
+        kind: "provider_switch_confirm",
+        title: `warning: switching ${fromProvider} -> ${params.modelProvider} will clear conversation context`,
+        index: 0,
+        options: switchOptions,
+        modelId: params.modelId,
+        modelLabel: params.modelLabel,
+        modelProvider: params.modelProvider,
+        thinkingLevel: params.thinkingLevel,
+        openRouterProvider: params.openRouterProvider,
+      });
+      return;
+    }
 
     setSelectedModel(params.modelId);
     setSelectedThinking(params.thinkingLevel);
@@ -1144,6 +1204,28 @@ function App() {
             return;
           }
           resumeSession(session);
+          return;
+        }
+
+        if (selector.kind === "provider_switch_confirm") {
+          const switchChoice = selector.options[selector.index];
+          if (!switchChoice) {
+            return;
+          }
+          if (switchChoice.id === "switch_cancel") {
+            appendSystemMessage("provider switch canceled.");
+            setSelector(null);
+            setInput("");
+            return;
+          }
+          applyModelSelection({
+            modelId: selector.modelId,
+            modelLabel: selector.modelLabel,
+            modelProvider: selector.modelProvider,
+            thinkingLevel: selector.thinkingLevel,
+            openRouterProvider: selector.openRouterProvider,
+            bypassProviderSwitchWarning: true,
+          });
           return;
         }
 
