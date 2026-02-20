@@ -1,5 +1,5 @@
 ﻿import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Box, Newline, render, Text, useApp, useInput } from "ink";
+import { Box, Newline, render, Text, useApp, useInput, useStdout } from "ink";
 import TextInput from "ink-text-input";
 import { loafConfig, type AuthProvider, type ThinkingLevel } from "./config.js";
 import {
@@ -213,6 +213,7 @@ const SEARCH_WEB_PROMPT_EXTENSION = [
 
 function App() {
   const { exit } = useApp();
+  const { stdout } = useStdout();
   const exitShortcutLabel = getExitShortcutLabel();
   const initialModelOptionsByProvider = useMemo(
     () =>
@@ -278,7 +279,24 @@ function App() {
   const [inputHistoryIndex, setInputHistoryIndex] = useState<number | null>(null);
   const [inputHistoryDraft, setInputHistoryDraft] = useState("");
   const [messages, setMessages] = useState<UiMessage[]>([]);
+  const [terminalRows, setTerminalRows] = useState<number>(() => stdout.rows ?? 24);
   const nextIdRef = useRef(1);
+
+  useEffect(() => {
+    const handleResize = () => {
+      setTerminalRows(stdout.rows ?? 24);
+    };
+
+    handleResize();
+    stdout.on("resize", handleResize);
+    return () => {
+      if (typeof stdout.off === "function") {
+        stdout.off("resize", handleResize);
+      } else {
+        stdout.removeListener("resize", handleResize);
+      }
+    };
+  }, [stdout]);
   const activeInferenceAbortControllerRef = useRef<AbortController | null>(null);
   const steeringQueueRef = useRef<ChatMessage[]>([]);
 
@@ -1434,6 +1452,7 @@ function App() {
     }
   });
 
+  const transcriptViewportHeight = useMemo(() => Math.max(8, terminalRows - 10), [terminalRows]);
   const visibleMessages = useMemo(() => messages.slice(-MAX_VISIBLE_MESSAGES), [messages]);
 
   const sendPrompt = async (prompt: string) => {
@@ -1727,7 +1746,7 @@ function App() {
           : "not selected"}
       </Text>
       <Newline />
-      <Box flexDirection="column">
+      <Box flexDirection="column" height={transcriptViewportHeight} overflow="hidden">
         {visibleMessages.map((message) => (
           <MessageRow key={message.id} message={message} />
         ))}
@@ -2829,7 +2848,6 @@ async function startApp(): Promise<void> {
     const customTools = await loadCustomTools();
     if (customTools.loaded.length > 0) {
       const names = customTools.loaded.map((tool) => tool.name).join(", ");
-      console.log(`[loaf] loaded ${customTools.loaded.length} custom tool(s): ${names}`);
     }
     for (const error of customTools.errors) {
       console.warn(`[loaf] custom tool warning: ${error}`);
