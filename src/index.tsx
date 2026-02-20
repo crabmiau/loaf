@@ -503,15 +503,27 @@ function App() {
       let accountId = openAiAccountId?.trim() || null;
       if (!accessToken) {
         setPending(true);
-        setStatusLabel("opening browser login...");
-        appendSystemMessage("starting chatgpt account login in your browser...");
+        setStatusLabel("starting oauth login...");
+        appendSystemMessage("starting chatgpt account login...");
         try {
-          const loginResult = await runOpenAiOauthLogin();
+          const loginResult = await runOpenAiOauthLogin({
+            onDeviceCode: (info) => {
+              const expiresMinutes = Math.max(1, Math.ceil(info.expiresInSeconds / 60));
+              setStatusLabel("waiting for device code confirmation...");
+              appendSystemMessage("headless login detected.");
+              appendSystemMessage(`open ${info.verificationUrl}`);
+              appendSystemMessage(`enter code: ${info.userCode} (expires in ~${expiresMinutes} min)`);
+            },
+          });
           accessToken = loginResult.chatgptAuth.accessToken;
           accountId = loginResult.chatgptAuth.accountId;
           setOpenAiAccessToken(accessToken);
           setOpenAiAccountId(accountId);
-          appendSystemMessage("chatgpt oauth login complete.");
+          appendSystemMessage(
+            loginResult.loginMethod === "device_code"
+              ? "chatgpt oauth login complete (device code flow)."
+              : "chatgpt oauth login complete.",
+          );
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           appendSystemMessage(`chatgpt oauth login failed: ${message}`);
@@ -2631,5 +2643,4 @@ async function startApp(): Promise<void> {
 
   render(<App />);
 }
-
 
