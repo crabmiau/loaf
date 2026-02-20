@@ -1,6 +1,14 @@
+export type ChatImageAttachment = {
+  path: string;
+  mimeType: string;
+  dataUrl: string;
+  byteSize: number;
+};
+
 export type ChatMessage = {
   role: "user" | "assistant";
   text: string;
+  images?: ChatImageAttachment[];
 };
 
 export type ModelResult = {

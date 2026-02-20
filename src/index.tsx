@@ -1,4 +1,8 @@
 ﻿import React, { useEffect, useMemo, useRef, useState } from "react";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { Box, Newline, render, Text, useApp, useInput } from "ink";
 import TextInput from "ink-text-input";
 import { loafConfig, type AuthProvider, type ThinkingLevel } from "./config.js";
@@ -30,7 +34,7 @@ import {
 import { runOpenAiInferenceStream } from "./openai.js";
 import { listOpenRouterProvidersForModel, runOpenRouterInferenceStream } from "./openrouter.js";
 import { configureBuiltinTools, defaultToolRegistry, loadCustomTools } from "./tools/index.js";
-import type { ChatMessage, DebugEvent } from "./chat-types.js";
+import type { ChatImageAttachment, ChatMessage, DebugEvent } from "./chat-types.js";
 import {
   buildSkillPromptContext,
   loadSkillsCatalog,
@@ -42,6 +46,7 @@ type UiMessage = {
   id: number;
   kind: "user" | "assistant" | "system";
   text: string;
+  images?: ChatImageAttachment[];
 };
 
 type AuthOption = {
@@ -210,6 +215,17 @@ const COMMAND_OPTIONS: CommandOption[] = [
 const SUPER_DEBUG_COMMAND = "/superdebug-69";
 const MAX_INPUT_HISTORY = 200;
 const MAX_VISIBLE_MESSAGES = 14;
+const MAX_PENDING_IMAGES = 4;
+const MAX_IMAGE_FILE_BYTES = 8 * 1024 * 1024;
+const CLIPBOARD_IMAGE_CAPTURE_MAX_BUFFER = MAX_IMAGE_FILE_BYTES + 512 * 1024;
+const CLIPBOARD_OSASCRIPT_MAX_BUFFER = MAX_IMAGE_FILE_BYTES * 3;
+const IMAGE_MIME_BY_EXT: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+};
 // Keep user prefix ASCII to avoid terminal width ambiguity clipping tail characters.
 const GLYPH_USER = "> ";
 const GLYPH_ASSISTANT = "\u27E3 ";
@@ -288,6 +304,7 @@ function App() {
   const [commandIndex, setCommandIndex] = useState(0);
   const [skillIndex, setSkillIndex] = useState(0);
   const [availableSkills, setAvailableSkills] = useState<SkillDefinition[]>(initialSkillCatalog.skills);
+  const [pendingImages, setPendingImages] = useState<ChatImageAttachment[]>([]);
   const [history, setHistory] = useState<ChatMessage[]>([]);
   const [activeSession, setActiveSession] = useState<ChatSessionSummary | null>(null);
   const [inputHistory, setInputHistory] = useState<string[]>(initialInputHistory);
@@ -300,6 +317,15 @@ function App() {
   const queuedPromptsRef = useRef<string[]>([]);
   const [queuedPromptsVersion, setQueuedPromptsVersion] = useState(0);
   const suppressNextSubmitRef = useRef(false);
+  const suppressCtrlVEchoRef = useRef<{
+    active: boolean;
+    previousInput: string;
+    timeout: ReturnType<typeof setTimeout> | null;
+  }>({
+    active: false,
+    previousInput: "",
+    timeout: null,
+  });
 
   const nextMessageId = () => {
     const id = nextIdRef.current;
@@ -377,6 +403,15 @@ function App() {
       setAutocompletedSkillPrefix(null);
     }
   }, [input, autocompletedSkillPrefix]);
+
+  useEffect(() => {
+    return () => {
+      if (suppressCtrlVEchoRef.current.timeout) {
+        clearTimeout(suppressCtrlVEchoRef.current.timeout);
+        suppressCtrlVEchoRef.current.timeout = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     configureBuiltinTools({
@@ -534,6 +569,32 @@ function App() {
     setInput("");
     appendSystemMessage(
       `queued message (${queuedPromptsRef.current.length}): ${clipInline(text, 80)}`,
+    );
+    return true;
+  };
+
+  const queueImageAttachment = (image: ChatImageAttachment): boolean => {
+    if (pendingImages.some((existing) => existing.path === image.path)) {
+      appendSystemMessage(`image already attached: ${path.basename(image.path)}`);
+      return false;
+    }
+    if (pendingImages.length >= MAX_PENDING_IMAGES) {
+      appendSystemMessage(`image limit reached (${MAX_PENDING_IMAGES}). send or /clear first.`);
+      return false;
+    }
+
+    const placeholder = `[Image ${pendingImages.length + 1}]`;
+    setPendingImages((current) => [...current, image]);
+    setInput((current) => {
+      const base = suppressCtrlVEchoRef.current.active
+        ? consumeCtrlVEchoArtifact(current, suppressCtrlVEchoRef.current.previousInput)
+        : current;
+      return appendImagePlaceholderToComposerInput(base, placeholder);
+    });
+    // Keep cursor at the end (right after the inserted image placeholder).
+    setTextInputResetKey((current) => current + 1);
+    appendSystemMessage(
+      `image attached: ${path.basename(image.path)} (${image.mimeType}, ${formatByteSize(image.byteSize)})`,
     );
     return true;
   };
@@ -779,7 +840,10 @@ function App() {
     | HistoryOption
     | ProviderSwitchConfirmOption
   > => {
-    if (currentSelector.kind === "openrouter_api_key" || currentSelector.kind === "exa_api_key") {
+    if (
+      currentSelector.kind === "openrouter_api_key" ||
+      currentSelector.kind === "exa_api_key"
+    ) {
       return [];
     }
     if (currentSelector.kind === "model") {
@@ -1027,6 +1091,7 @@ function App() {
       setSelectedThinking(loafConfig.thinkingLevel);
       setPending(false);
       setStatusLabel("ready");
+      setPendingImages([]);
       setConversationProvider(null);
       setHistory([]);
       setActiveSession(null);
@@ -1066,6 +1131,7 @@ function App() {
       setHistory([]);
       setConversationProvider(null);
       setActiveSession(null);
+      setPendingImages([]);
       return;
     }
 
@@ -1191,6 +1257,32 @@ function App() {
       return;
     }
 
+    if (!selector && isImageAttachKeybind(character, key)) {
+      if (suppressCtrlVEchoRef.current.timeout) {
+        clearTimeout(suppressCtrlVEchoRef.current.timeout);
+      }
+      suppressCtrlVEchoRef.current = {
+        active: true,
+        previousInput: input,
+        timeout: setTimeout(() => {
+          suppressCtrlVEchoRef.current.active = false;
+          suppressCtrlVEchoRef.current.timeout = null;
+        }, 120),
+      };
+      const attachment = readClipboardImageAttachment();
+      if (attachment.ok) {
+        queueImageAttachment(attachment.image);
+        return;
+      }
+      suppressCtrlVEchoRef.current.active = false;
+      if (suppressCtrlVEchoRef.current.timeout) {
+        clearTimeout(suppressCtrlVEchoRef.current.timeout);
+        suppressCtrlVEchoRef.current.timeout = null;
+      }
+      appendSystemMessage(`paste image failed: ${attachment.error}`);
+      return;
+    }
+
     if (!selector && pending && key.return && key.shift) {
       const trimmed = input.trim();
       if (!trimmed) {
@@ -1242,14 +1334,20 @@ function App() {
       }
 
       if (key.upArrow || key.downArrow) {
-        if (selector.kind === "openrouter_api_key" || selector.kind === "exa_api_key") {
+        if (
+          selector.kind === "openrouter_api_key" ||
+          selector.kind === "exa_api_key"
+        ) {
           return;
         }
         setSelector((current) => {
           if (!current) {
             return current;
           }
-          if (current.kind === "openrouter_api_key" || current.kind === "exa_api_key") {
+          if (
+            current.kind === "openrouter_api_key" ||
+            current.kind === "exa_api_key"
+          ) {
             return current;
           }
           const direction = key.downArrow ? 1 : -1;
@@ -1576,7 +1674,9 @@ function App() {
 
   const sendPrompt = async (prompt: string) => {
     const cleanPrompt = prompt.trim();
-    if (!cleanPrompt || pending) {
+    const promptImages = pendingImages;
+    const promptWithImageRefs = appendMissingImagePlaceholders(cleanPrompt, promptImages.length);
+    if ((!cleanPrompt && promptImages.length === 0) || pending) {
       return;
     }
     if (!onboardingCompleted) {
@@ -1606,7 +1706,7 @@ function App() {
       return;
     }
     const skillCatalog = refreshSkillsCatalog();
-    const skillPromptContext = buildSkillPromptContext(cleanPrompt, skillCatalog.skills);
+    const skillPromptContext = buildSkillPromptContext(promptWithImageRefs, skillCatalog.skills);
     if (skillPromptContext.selection.combined.length > 0) {
       appendSystemMessage(
         `skills applied: ${skillPromptContext.selection.combined.map((skill) => skill.name).join(", ")}`,
@@ -1614,12 +1714,15 @@ function App() {
     }
 
     setInput("");
-    setInputHistory((current) => {
-      const next = [...current, cleanPrompt];
-      return next.slice(-MAX_INPUT_HISTORY);
-    });
+    if (cleanPrompt) {
+      setInputHistory((current) => {
+        const next = [...current, cleanPrompt];
+        return next.slice(-MAX_INPUT_HISTORY);
+      });
+    }
     setInputHistoryIndex(null);
     setInputHistoryDraft("");
+    setPendingImages([]);
     setPending(true);
     setStatusLabel(selectedThinking === "OFF" ? "drafting response..." : "thinking...");
     steeringQueueRef.current = [];
@@ -1654,7 +1757,9 @@ function App() {
           model: selectedModel,
           thinkingLevel: selectedThinking,
           openRouterProvider: normalizedOpenRouterProvider,
-          titleHint: cleanPrompt,
+          titleHint:
+            cleanPrompt ||
+            (promptImages.length > 0 ? `image: ${path.basename(promptImages[0]!.path)}` : undefined),
         });
         setActiveSession(sessionForTurn);
       } catch (error) {
@@ -1665,15 +1770,27 @@ function App() {
       }
     }
 
-    const nextHistory = [...historyBase, { role: "user" as const, text: cleanPrompt }];
+    const nextHistory = [
+      ...historyBase,
+      {
+        role: "user" as const,
+        text: promptWithImageRefs,
+        images: promptImages.length > 0 ? promptImages : undefined,
+      },
+    ];
     const modelHistory: ChatMessage[] = [
       ...mapMessagesForModel(historyBase, skillCatalog.skills),
-      { role: "user", text: skillPromptContext.modelPrompt },
+      {
+        role: "user",
+        text: skillPromptContext.modelPrompt,
+        images: promptImages.length > 0 ? promptImages : undefined,
+      },
     ];
     const nextUserMessage: UiMessage = {
       id: nextMessageId(),
       kind: "user",
-      text: cleanPrompt,
+      text: promptWithImageRefs,
+      images: promptImages.length > 0 ? promptImages : undefined,
     };
     setMessages((current) => [...current, nextUserMessage]);
 
@@ -1977,12 +2094,36 @@ function App() {
           key={`prompt-input-${textInputResetKey}`}
           value={input}
           onChange={(value) => {
+            let nextValue = value;
+            if (suppressCtrlVEchoRef.current.active) {
+              const previousInput = suppressCtrlVEchoRef.current.previousInput;
+              const consumed = consumeCtrlVEchoArtifact(nextValue, previousInput);
+              if (consumed !== nextValue) {
+                suppressCtrlVEchoRef.current.active = false;
+                if (suppressCtrlVEchoRef.current.timeout) {
+                  clearTimeout(suppressCtrlVEchoRef.current.timeout);
+                  suppressCtrlVEchoRef.current.timeout = null;
+                }
+                // Swallow the Ctrl+V echo event and keep the current composer state.
+                return;
+              }
+              suppressCtrlVEchoRef.current.active = false;
+              if (suppressCtrlVEchoRef.current.timeout) {
+                clearTimeout(suppressCtrlVEchoRef.current.timeout);
+                suppressCtrlVEchoRef.current.timeout = null;
+              }
+            }
             if (
               selector?.kind === "openrouter_api_key" ||
               selector?.kind === "exa_api_key" ||
               selector?.kind === "model" ||
               !selector
             ) {
+              const reconciled = reconcilePendingImagesWithComposerText(nextValue, pendingImages);
+              nextValue = reconciled.text;
+              if (!areImageAttachmentListsEqual(reconciled.images, pendingImages)) {
+                setPendingImages(reconciled.images);
+              }
               if (inputHistoryIndex !== null) {
                 setInputHistoryIndex(null);
                 setInputHistoryDraft("");
@@ -1998,7 +2139,7 @@ function App() {
                   };
                 });
               }
-              setInput(value);
+              setInput(nextValue);
             }
           }}
           onSubmit={(submitted) => {
@@ -2007,7 +2148,11 @@ function App() {
               return;
             }
 
-            if (selector && selector.kind !== "openrouter_api_key" && selector.kind !== "exa_api_key") {
+            if (
+              selector &&
+              selector.kind !== "openrouter_api_key" &&
+              selector.kind !== "exa_api_key"
+            ) {
               return;
             }
 
@@ -2020,17 +2165,24 @@ function App() {
             }
 
             const trimmed = submitted.trim();
-            if (!trimmed) {
+            if (!trimmed && pendingImages.length === 0) {
               return;
             }
 
-            if (selector?.kind === "openrouter_api_key" || selector?.kind === "exa_api_key") {
+            if (
+              selector?.kind === "openrouter_api_key" ||
+              selector?.kind === "exa_api_key"
+            ) {
               return;
             }
 
             if (pending) {
               if (!activeInferenceAbortControllerRef.current) {
                 appendSystemMessage("busy. wait for current operation to finish.");
+                return;
+              }
+              if (!trimmed) {
+                appendSystemMessage("cannot queue an empty prompt while running.");
                 return;
               }
 
@@ -2072,6 +2224,7 @@ function App() {
       </Box>
       <Text color="gray">
         {pending ? "esc interrupt | enter queue | shift+enter steer | " : ""}
+        {getAttachImageShortcutLabel()} attach image |{" "}
         {exitShortcutLabel} exit | /help for commands
       </Text>
     </Box>
@@ -2577,7 +2730,12 @@ function MessageRow({ message }: { message: UiMessage }) {
   if (message.kind === "user") {
     return (
       <Box flexDirection="column" marginBottom={1}>
-        <Text color="blueBright">{GLYPH_USER}{message.text}</Text>
+        <Text color="blueBright">{GLYPH_USER}{message.text || "[image]"}</Text>
+        {message.images?.map((image, index) => (
+          <Text key={`${message.id}-img-${index}`} color="gray">
+            {"  "}image: {path.basename(image.path)} ({image.mimeType}, {formatByteSize(image.byteSize)})
+          </Text>
+        ))}
       </Box>
     );
   }
@@ -2600,6 +2758,7 @@ function chatHistoryToUiMessages(history: ChatMessage[], nextMessageId: () => nu
     id: nextMessageId(),
     kind: message.role,
     text: message.text,
+    images: message.images,
   }));
 }
 
@@ -2624,6 +2783,386 @@ function getExitShortcutLabel(): string {
     return "ctrl+c";
   }
   return "control+c";
+}
+
+function getAttachImageShortcutLabel(): string {
+  if (process.platform === "darwin") {
+    return "control+v";
+  }
+  return "ctrl+v";
+}
+
+function isImageAttachKeybind(
+  character: string,
+  key: { ctrl?: boolean },
+): boolean {
+  const normalized = (character ?? "").toLowerCase();
+  if (normalized !== "v") {
+    return false;
+  }
+  // Match Codex behavior: paste images on Ctrl+V.
+  return key.ctrl === true;
+}
+
+function readClipboardText(): string {
+  const run = (command: string, args: string[]): string => {
+    try {
+      const result = spawnSync(command, args, {
+        encoding: "utf8",
+        maxBuffer: 1024 * 1024,
+      });
+      if (result.status !== 0) {
+        return "";
+      }
+      return (result.stdout ?? "").trim();
+    } catch {
+      return "";
+    }
+  };
+
+  if (process.platform === "darwin") {
+    return run("pbpaste", []);
+  }
+  if (process.platform === "win32") {
+    return run("powershell", ["-NoProfile", "-Command", "Get-Clipboard -Raw"]);
+  }
+  return run("sh", [
+    "-lc",
+    "(wl-paste -n 2>/dev/null || xclip -selection clipboard -o 2>/dev/null || xsel --clipboard --output 2>/dev/null)",
+  ]);
+}
+
+function readClipboardImageAttachment():
+  | { ok: true; image: ChatImageAttachment }
+  | { ok: false; error: string } {
+  const fromImageBytes = readClipboardImagePngBytes();
+  if (fromImageBytes) {
+    if (fromImageBytes.length > MAX_IMAGE_FILE_BYTES) {
+      return {
+        ok: false,
+        error: `clipboard image too large (${formatByteSize(fromImageBytes.length)}). max is ${formatByteSize(MAX_IMAGE_FILE_BYTES)}`,
+      };
+    }
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    return {
+      ok: true,
+      image: {
+        path: `clipboard-image-${stamp}.png`,
+        mimeType: "image/png",
+        dataUrl: `data:image/png;base64,${fromImageBytes.toString("base64")}`,
+        byteSize: fromImageBytes.length,
+      },
+    };
+  }
+
+  const clipboardText = readClipboardText();
+  if (clipboardText) {
+    const fromPath = loadImageAttachment(clipboardText);
+    if (fromPath.ok) {
+      return fromPath;
+    }
+  }
+
+  return { ok: false, error: "clipboard has no image (or image path)." };
+}
+
+function readClipboardImagePngBytes(): Buffer | null {
+  if (process.platform !== "darwin") {
+    return null;
+  }
+
+  const viaPngPaste = spawnBuffer("pngpaste", ["-"]);
+  if (viaPngPaste && viaPngPaste.length > 0) {
+    return viaPngPaste;
+  }
+
+  const viaAppleScriptPng = readClipboardImageViaAppleScript("PNGf");
+  if (viaAppleScriptPng && viaAppleScriptPng.length > 0) {
+    return viaAppleScriptPng;
+  }
+
+  return null;
+}
+
+function readClipboardImageViaAppleScript(classCode: "PNGf"): Buffer | null {
+  const script = `the clipboard as «class ${classCode}»`;
+  const raw = spawnText("osascript", ["-e", script], {
+    timeoutMs: 900,
+    maxBuffer: CLIPBOARD_OSASCRIPT_MAX_BUFFER,
+  });
+  if (!raw) {
+    return null;
+  }
+
+  const match = raw.match(/«data\s+[A-Za-z0-9]{4}([A-Fa-f0-9\s]+)»/s);
+  if (!match?.[1]) {
+    return null;
+  }
+  const hex = match[1].replace(/\s+/g, "");
+  if (!hex || hex.length % 2 !== 0) {
+    return null;
+  }
+
+  try {
+    return Buffer.from(hex, "hex");
+  } catch {
+    return null;
+  }
+}
+
+function spawnBuffer(command: string, args: string[]): Buffer | null {
+  try {
+    const result = spawnSync(command, args, {
+      maxBuffer: CLIPBOARD_IMAGE_CAPTURE_MAX_BUFFER,
+      timeout: 600,
+    });
+    if (result.status !== 0) {
+      return null;
+    }
+    const output = result.stdout;
+    if (!output || (Buffer.isBuffer(output) && output.length === 0)) {
+      return null;
+    }
+    return Buffer.isBuffer(output) ? output : Buffer.from(output);
+  } catch {
+    return null;
+  }
+}
+
+function spawnText(
+  command: string,
+  args: string[],
+  opts?: { timeoutMs?: number; maxBuffer?: number },
+): string | null {
+  try {
+    const result = spawnSync(command, args, {
+      encoding: "utf8",
+      timeout: opts?.timeoutMs ?? 600,
+      maxBuffer: opts?.maxBuffer ?? CLIPBOARD_IMAGE_CAPTURE_MAX_BUFFER,
+    });
+    if (result.status !== 0) {
+      return null;
+    }
+    const text = (result.stdout ?? "").trim();
+    return text || null;
+  } catch {
+    return null;
+  }
+}
+
+function loadImageAttachment(rawPath: string): { ok: true; image: ChatImageAttachment } | { ok: false; error: string } {
+  const resolvedPath = resolveImagePath(rawPath);
+  if (!resolvedPath) {
+    return { ok: false, error: "no file path provided" };
+  }
+  if (!fs.existsSync(resolvedPath)) {
+    return { ok: false, error: `file not found: ${resolvedPath}` };
+  }
+
+  let stats: fs.Stats;
+  try {
+    stats = fs.statSync(resolvedPath);
+  } catch {
+    return { ok: false, error: `unable to stat file: ${resolvedPath}` };
+  }
+  if (!stats.isFile()) {
+    return { ok: false, error: `not a file: ${resolvedPath}` };
+  }
+  if (stats.size > MAX_IMAGE_FILE_BYTES) {
+    return {
+      ok: false,
+      error: `image too large (${formatByteSize(stats.size)}). max is ${formatByteSize(MAX_IMAGE_FILE_BYTES)}`,
+    };
+  }
+
+  const extension = path.extname(resolvedPath).toLowerCase();
+  const mimeType = IMAGE_MIME_BY_EXT[extension];
+  if (!mimeType) {
+    return {
+      ok: false,
+      error: `unsupported image type: ${extension || "(no extension)"}. supported: ${Object.keys(IMAGE_MIME_BY_EXT).join(", ")}`,
+    };
+  }
+
+  let bytes: Buffer;
+  try {
+    bytes = fs.readFileSync(resolvedPath);
+  } catch {
+    return { ok: false, error: `unable to read image file: ${resolvedPath}` };
+  }
+
+  const dataUrl = `data:${mimeType};base64,${bytes.toString("base64")}`;
+  return {
+    ok: true,
+    image: {
+      path: resolvedPath,
+      mimeType,
+      dataUrl,
+      byteSize: stats.size,
+    },
+  };
+}
+
+function resolveImagePath(rawPath: string): string {
+  const trimmed = rawPath.trim();
+  if (!trimmed) {
+    return "";
+  }
+  let normalized = trimmed;
+  if (
+    (normalized.startsWith("\"") && normalized.endsWith("\"")) ||
+    (normalized.startsWith("'") && normalized.endsWith("'"))
+  ) {
+    normalized = normalized.slice(1, -1).trim();
+  }
+  if (normalized.startsWith("file://")) {
+    try {
+      normalized = decodeURIComponent(normalized.slice("file://".length));
+    } catch {
+      normalized = normalized.slice("file://".length);
+    }
+  }
+  if (normalized.startsWith("~/")) {
+    normalized = path.join(os.homedir(), normalized.slice(2));
+  }
+  if (path.isAbsolute(normalized)) {
+    return normalized;
+  }
+  return path.resolve(process.cwd(), normalized);
+}
+
+function formatByteSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return "0 b";
+  }
+  if (bytes < 1024) {
+    return `${Math.floor(bytes)} b`;
+  }
+  const kb = bytes / 1024;
+  if (kb < 1024) {
+    return `${kb.toFixed(kb >= 100 ? 0 : kb >= 10 ? 1 : 2)} kb`;
+  }
+  const mb = kb / 1024;
+  return `${mb.toFixed(mb >= 100 ? 0 : mb >= 10 ? 1 : 2)} mb`;
+}
+
+function appendImagePlaceholderToComposerInput(input: string, placeholder: string): string {
+  const current = input;
+  const currentLower = current.toLowerCase();
+  if (currentLower.includes(placeholder.toLowerCase())) {
+    return current;
+  }
+  if (!current.trim()) {
+    return placeholder;
+  }
+  const separator = current.endsWith(" ") ? "" : " ";
+  return `${current}${separator}${placeholder}`;
+}
+
+function consumeCtrlVEchoArtifact(value: string, previousInput: string): string {
+  const candidates = [
+    `${previousInput}v`,
+    `${previousInput}V`,
+    `v${previousInput}`,
+    `V${previousInput}`,
+  ];
+  for (const candidate of candidates) {
+    if (value === candidate) {
+      return previousInput;
+    }
+  }
+
+  if (!previousInput.trim() && (value === "v" || value === "V")) {
+    return "";
+  }
+  return value;
+}
+
+function reconcilePendingImagesWithComposerText(
+  text: string,
+  images: ChatImageAttachment[],
+): { text: string; images: ChatImageAttachment[] } {
+  if (images.length === 0) {
+    return { text, images };
+  }
+
+  const placeholderRegex = /\[image\s+(\d+)\]/gi;
+  const referenced = new Set<number>();
+  let match: RegExpExecArray | null;
+  while ((match = placeholderRegex.exec(text)) !== null) {
+    const parsedIndex = Number.parseInt(match[1] ?? "", 10);
+    if (!Number.isFinite(parsedIndex) || parsedIndex < 1 || parsedIndex > images.length) {
+      continue;
+    }
+    referenced.add(parsedIndex);
+  }
+
+  const keptOldIndexes: number[] = [];
+  for (let index = 1; index <= images.length; index += 1) {
+    if (referenced.has(index)) {
+      keptOldIndexes.push(index);
+    }
+  }
+
+  const remap = new Map<number, number>();
+  keptOldIndexes.forEach((oldIndex, offset) => {
+    remap.set(oldIndex, offset + 1);
+  });
+
+  const nextImages = keptOldIndexes.map((oldIndex) => images[oldIndex - 1]!).filter(Boolean);
+  const normalizedText = text.replace(placeholderRegex, (full, rawIndex: string) => {
+    const parsedIndex = Number.parseInt(rawIndex, 10);
+    const mappedIndex = remap.get(parsedIndex);
+    if (!mappedIndex) {
+      return full;
+    }
+    return `[Image ${mappedIndex}]`;
+  });
+
+  return {
+    text: normalizedText,
+    images: nextImages,
+  };
+}
+
+function areImageAttachmentListsEqual(
+  left: ChatImageAttachment[],
+  right: ChatImageAttachment[],
+): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    const leftImage = left[index];
+    const rightImage = right[index];
+    if (!leftImage || !rightImage) {
+      return false;
+    }
+    if (leftImage.path !== rightImage.path || leftImage.byteSize !== rightImage.byteSize) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function appendMissingImagePlaceholders(prompt: string, imageCount: number): string {
+  const base = prompt.trim();
+  if (imageCount <= 0) {
+    return base;
+  }
+
+  const labels = Array.from({ length: imageCount }, (_, index) => `[Image ${index + 1}]`);
+  if (!base) {
+    return labels.join(" ");
+  }
+
+  const baseLower = base.toLowerCase();
+  const missing = labels.filter((label) => !baseLower.includes(label.toLowerCase()));
+  if (missing.length === 0) {
+    return base;
+  }
+
+  return `${base} ${missing.join(" ")}`.trim();
 }
 
 function parseThoughtTitle(rawThought: string): string {

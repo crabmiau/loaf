@@ -436,7 +436,7 @@ function messagesToResponsesInput(messages: ChatMessage[]): Array<Record<string,
   return messages.map((message) => ({
     type: "message",
     role: message.role,
-    content: message.text,
+    content: toOpenAiMessageContent(message),
   }));
 }
 
@@ -444,8 +444,38 @@ function chatMessagesToResponsesInput(messages: ChatMessage[]): Array<Record<str
   return messages.map((message) => ({
     type: "message",
     role: message.role,
-    content: message.text,
+    content: toOpenAiMessageContent(message),
   }));
+}
+
+function toOpenAiMessageContent(message: ChatMessage): string | Array<Record<string, unknown>> {
+  if (message.role !== "user" || !Array.isArray(message.images) || message.images.length === 0) {
+    return message.text;
+  }
+
+  const parts: Array<Record<string, unknown>> = [];
+  const text = message.text.trim();
+  if (text) {
+    parts.push({
+      type: "input_text",
+      text,
+    });
+  }
+
+  for (const image of message.images) {
+    if (!image.dataUrl || !image.dataUrl.startsWith("data:")) {
+      continue;
+    }
+    parts.push({
+      type: "input_image",
+      image_url: image.dataUrl,
+    });
+  }
+
+  if (parts.length === 0) {
+    return message.text;
+  }
+  return parts;
 }
 
 function safeParseObject(raw: unknown): Record<string, unknown> {

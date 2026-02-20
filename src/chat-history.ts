@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AuthProvider, ThinkingLevel } from "./config.js";
 import { getLoafDataDir } from "./persistence.js";
-import type { ChatMessage } from "./chat-types.js";
+import type { ChatImageAttachment, ChatMessage } from "./chat-types.js";
 
 const SESSIONS_DIR = path.join(getLoafDataDir(), "sessions");
 const SESSION_FILE_PREFIX = "rollout-";
@@ -28,6 +28,7 @@ type SessionMessageLine = {
   index: number;
   role: ChatMessage["role"];
   text: string;
+  images?: ChatImageAttachment[];
 };
 
 export type ChatSessionSummary = {
@@ -108,6 +109,7 @@ export function writeChatSession(params: {
       index: i,
       role: normalizedMessages[i]!.role,
       text: normalizedMessages[i]!.text,
+      images: normalizedMessages[i]!.images,
     });
   }
   writeRolloutFile(params.session.rolloutPath, lines);
@@ -218,10 +220,12 @@ export function loadChatSession(rolloutPath: string): ChatSessionRecord | null {
       if (typeValue === "message") {
         const role = parsed.role;
         const text = readTrimmedString(parsed.text);
-        if ((role === "user" || role === "assistant") && text) {
+        const images = normalizeChatImages(parsed.images);
+        if ((role === "user" || role === "assistant") && (text || images.length > 0)) {
           messages.push({
             role,
             text,
+            images: images.length > 0 ? images : undefined,
           });
         }
       }
@@ -387,13 +391,58 @@ function normalizeChatMessage(message: ChatMessage): ChatMessage | null {
     return null;
   }
   const text = message.text.trim();
-  if (!text) {
+  const images = normalizeChatImages(message.images);
+  const hasImages = images.length > 0;
+  if (!text && !hasImages) {
     return null;
+  }
+  if (message.role === "assistant") {
+    return {
+      role: message.role,
+      text,
+    };
   }
   return {
     role: message.role,
     text,
+    images: hasImages ? images : undefined,
   };
+}
+
+function normalizeChatImages(value: unknown): ChatImageAttachment[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const normalized: ChatImageAttachment[] = [];
+  for (const rawImage of value) {
+    if (!isRecord(rawImage)) {
+      continue;
+    }
+    const path = readTrimmedString(rawImage.path);
+    const mimeType = readTrimmedString(rawImage.mimeType).toLowerCase();
+    const dataUrl = readTrimmedString(rawImage.dataUrl);
+    const byteSizeRaw = rawImage.byteSize;
+    const byteSize =
+      typeof byteSizeRaw === "number" && Number.isFinite(byteSizeRaw) && byteSizeRaw >= 0
+        ? Math.floor(byteSizeRaw)
+        : null;
+
+    if (!path || !mimeType || !dataUrl || byteSize === null) {
+      continue;
+    }
+    if (!dataUrl.startsWith("data:")) {
+      continue;
+    }
+    normalized.push({
+      path,
+      mimeType,
+      dataUrl,
+      byteSize,
+    });
+  }
+
+  return normalized;
 }
 
 function deriveSessionTitle(messages: ChatMessage[], titleHint?: string): string {

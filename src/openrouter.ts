@@ -132,7 +132,7 @@ export async function runOpenRouterInferenceStream(
     },
     ...request.messages.map((message) => ({
       role: message.role,
-      content: message.text,
+      content: toOpenRouterMessageContent(message),
     })),
   ];
 
@@ -144,7 +144,7 @@ export async function runOpenRouterInferenceStream(
       conversation.push(
         ...steeringMessages.map((message) => ({
           role: message.role,
-          content: message.text,
+          content: toOpenRouterMessageContent(message),
         })),
       );
       onDebug?.({
@@ -613,6 +613,38 @@ function normalizeContentString(content: unknown): string {
     }
   }
   return chunks.join("\n").trim();
+}
+
+function toOpenRouterMessageContent(message: ChatMessage): string | Array<Record<string, unknown>> {
+  if (message.role !== "user" || !Array.isArray(message.images) || message.images.length === 0) {
+    return message.text;
+  }
+
+  const parts: Array<Record<string, unknown>> = [];
+  const text = message.text.trim();
+  if (text) {
+    parts.push({
+      type: "text",
+      text,
+    });
+  }
+
+  for (const image of message.images) {
+    if (!image.dataUrl || !image.dataUrl.startsWith("data:")) {
+      continue;
+    }
+    parts.push({
+      type: "image_url",
+      image_url: {
+        url: image.dataUrl,
+      },
+    });
+  }
+
+  if (parts.length === 0) {
+    return message.text;
+  }
+  return parts;
 }
 
 function safeParseObject(raw: string): Record<string, unknown> {
