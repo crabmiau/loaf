@@ -53,6 +53,7 @@ export type OpenAiOauthLoginOptions = {
   originator?: string;
   mode?: "auto" | "browser" | "device_code";
   onDeviceCode?: (info: OpenAiDeviceCodeInfo) => void;
+  onAuthUrl?: (url: string) => void;
 };
 
 export type OpenAiOauthLoginResult = {
@@ -171,6 +172,7 @@ export async function runOpenAiOauthLogin(
         timeoutMs,
         openBrowser,
         onDeviceCode: options.onDeviceCode,
+        onAuthUrl: options.onAuthUrl,
       });
       return {
         authUrl: result.deviceCode.verificationUrl,
@@ -197,6 +199,7 @@ export async function runOpenAiOauthLogin(
     codeChallenge: pkce.codeChallenge,
     originator,
   });
+  options.onAuthUrl?.(authUrl);
 
   if (openBrowser) {
     openExternalUrl(authUrl);
@@ -297,8 +300,10 @@ async function runOpenAiDeviceCodeLogin(options: {
   timeoutMs: number;
   openBrowser: boolean;
   onDeviceCode?: (info: OpenAiDeviceCodeInfo) => void;
+  onAuthUrl?: (url: string) => void;
 }): Promise<{ authFilePath: string; chatgptAuth: OpenAiChatgptAuth; deviceCode: OpenAiDeviceCodeInfo }> {
   const deviceCode = await requestOpenAiDeviceCode(options.issuer, options.clientId);
+  options.onAuthUrl?.(deviceCode.verificationUrl);
   options.onDeviceCode?.({
     verificationUrl: deviceCode.verificationUrl,
     userCode: deviceCode.userCode,

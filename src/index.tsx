@@ -4764,9 +4764,7 @@ function buildOsPromptExtension(): string {
   return `current host os: ${osName} (platform=${platform}, arch=${arch}). tailor commands and paths for this os.`;
 }
 
-void startApp();
-
-async function startApp(): Promise<void> {
+export async function startTuiApp(): Promise<void> {
   try {
     const customTools = await loadCustomTools();
     if (customTools.loaded.length > 0) {
