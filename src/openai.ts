@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { randomUUID } from "node:crypto";
 import { loafConfig, type ThinkingLevel } from "./config.js";
 import { defaultToolRegistry, defaultToolRuntime } from "./tools/index.js";
 import type { ChatMessage, DebugEvent, ModelResult, StreamChunk } from "./chat-types.js";
@@ -11,6 +12,7 @@ export type OpenAIRequest = {
   thinkingLevel: ThinkingLevel;
   includeThoughts: boolean;
   systemInstruction?: string;
+  sessionId?: string;
   signal?: AbortSignal;
   drainSteeringMessages?: () => ChatMessage[];
 };
@@ -31,18 +33,30 @@ type OpenAiResponse = {
   error?: {
     message?: string;
   } | null;
-  output?: Array<{
+  output?: OpenAiOutputItem[];
+};
+
+type OpenAiOutputItem = {
+  type?: string;
+  id?: string;
+  status?: string;
+  call_id?: string;
+  name?: string;
+  arguments?: string;
+  content?: Array<{
     type?: string;
-    id?: string;
-    status?: string;
-    call_id?: string;
-    name?: string;
-    arguments?: string;
-    content?: Array<{
-      type?: string;
-      text?: string;
-    }>;
+    text?: string | { value?: string };
+    value?: string;
   }>;
+};
+
+type OpenAiFunctionCallOutputBody = string | Array<Record<string, unknown>>;
+
+type OpenAiStreamResult = {
+  response: OpenAiResponse;
+  outputItemsDone: OpenAiOutputItem[];
+  completedEventSeen: boolean;
+  turnStateToken: string | null;
 };
 
 export type OpenAiCatalogModel = {
@@ -164,17 +178,23 @@ export async function runOpenAiInferenceStream(
 
   const client = createChatgptCodexClient(accessToken, request.chatgptAccountId);
   const systemInstruction = request.systemInstruction?.trim() || loafConfig.systemInstruction;
+  const sessionId = request.sessionId?.trim() || randomUUID();
+  let turnStateToken: string | null = null;
 
-  let conversationInput = messagesToResponsesInput(request.messages);
+  let conversationInput: Array<Record<string, unknown>> = [];
+  let pendingInput = messagesToResponsesInput(request.messages);
   const startedAt = Date.now();
   let toolRound = 0;
 
   while (true) {
     assertNotAborted(request.signal);
 
+    const roundInput: Array<Record<string, unknown>> = [...pendingInput];
+    pendingInput = [];
+
     const steeringMessages = request.drainSteeringMessages?.() ?? [];
     if (steeringMessages.length > 0) {
-      conversationInput = [...conversationInput, ...chatMessagesToResponsesInput(steeringMessages)];
+      roundInput.push(...chatMessagesToResponsesInput(steeringMessages));
       onDebug?.({
         stage: "steer_injected",
         data: {
@@ -187,12 +207,13 @@ export async function runOpenAiInferenceStream(
       });
     }
 
+    const fullInput = [...conversationInput, ...roundInput];
+
     toolRound += 1;
     const toolDeclarations = buildToolDeclarations();
     const requestPayload: Record<string, unknown> = {
       model: request.model,
       instructions: systemInstruction,
-      input: conversationInput,
       tools: toolDeclarations.declarations,
       tool_choice: "auto",
       parallel_tool_calls: false,
@@ -203,12 +224,23 @@ export async function runOpenAiInferenceStream(
     requestPayload.reasoning = {
       effort: mapThinkingToOpenAiEffort(request.thinkingLevel),
     };
+    // ChatGPT Codex HTTP streaming currently rejects follow-up `previous_response_id`
+    // requests for this interleaved tool path. Keep transport stateless and replay
+    // ordered input items each round.
+    requestPayload.input = fullInput;
+    const requestHeaders: Record<string, string> = {
+      session_id: sessionId,
+    };
+    if (turnStateToken) {
+      requestHeaders["x-codex-turn-state"] = turnStateToken;
+    }
 
     onDebug?.({
       stage: "request",
       data: {
         toolRound,
         payload: requestPayload,
+        headers: requestHeaders,
       },
     });
 
@@ -221,24 +253,33 @@ export async function runOpenAiInferenceStream(
       onChunk?.(chunk);
     };
 
-    const response = await createResponseWithRetry(
+    const streamResult = await createResponseWithRetry(
       client,
       requestPayload,
+      requestHeaders,
       toolRound,
       onDebug,
       handleChunkThisRound,
       request.signal,
     );
+    const response = streamResult.response;
+    if (streamResult.turnStateToken) {
+      turnStateToken = streamResult.turnStateToken;
+    }
+    const outputItems = pickOutputItemsForFollowUp(streamResult.outputItemsDone, response);
+    conversationInput = fullInput;
 
     onDebug?.({
       stage: "response_raw",
       data: {
         toolRound,
         response,
+        outputItemsDone: streamResult.outputItemsDone.length,
+        completedEventSeen: streamResult.completedEventSeen,
       },
     });
 
-    const functionCalls = selectActionableFunctionCalls(response.output);
+    const functionCalls = selectActionableFunctionCalls(outputItems);
     if (functionCalls.length > 0) {
       const preToolAnswer = extractResponseText(response).trim();
       const missingPreToolDelta = computeUnstreamedAnswerDelta(preToolAnswer, streamedAnswerTextThisRound);
@@ -269,7 +310,7 @@ export async function runOpenAiInferenceStream(
       const functionOutputs: Array<{
         type: "function_call_output";
         call_id: string;
-        output: string;
+        output: OpenAiFunctionCallOutputBody;
       }> = [];
       const replayFunctionCalls: Array<{
         type: "function_call";
@@ -334,14 +375,10 @@ export async function runOpenAiInferenceStream(
           },
         });
 
-        const responsePayload = toolResult.ok
-          ? { output: toolResult.output }
-          : { error: toolResult.error ?? "tool execution failed", output: toolResult.output };
-
         functionOutputs.push({
           type: "function_call_output",
           call_id: callId,
-          output: JSON.stringify(responsePayload),
+          output: toFunctionCallOutputBody(toolResult.output, toolResult.error),
         });
         replayFunctionCalls.push({
           type: "function_call",
@@ -359,30 +396,40 @@ export async function runOpenAiInferenceStream(
         },
       });
 
-      const followUpInput = buildFunctionCallFollowUpInput(replayFunctionCalls, functionOutputs);
-      conversationInput = [...conversationInput, ...followUpInput];
+      const followUpInputStateless = buildFunctionCallFollowUpInput({
+        output: outputItems,
+        functionCalls: replayFunctionCalls,
+        functionOutputs,
+      });
+      pendingInput = [...followUpInputStateless];
       continue;
     }
 
     const answer = extractResponseText(response).trim();
     const responseStatus = typeof response.status === "string" ? response.status.trim().toLowerCase() : "";
-    if (!answer && responseStatus && responseStatus !== "completed") {
+    if (!streamResult.completedEventSeen && responseStatus !== "completed") {
       onDebug?.({
         stage: "response_continue",
         data: {
           toolRound,
           responseStatus,
-          reason: "empty assistant text",
+          reason: "stream closed before response.completed",
         },
       });
-      conversationInput = [
-        ...conversationInput,
-        {
-          type: "message",
-          role: "user",
-          content: "continue",
+      continue;
+    }
+    if (responseStatus === "failed" || responseStatus === "cancelled") {
+      throw new Error(`OpenAI response did not complete successfully (status: ${responseStatus}).`);
+    }
+    if (responseStatus && responseStatus !== "completed") {
+      onDebug?.({
+        stage: "response_continue",
+        data: {
+          toolRound,
+          responseStatus,
+          reason: answer ? "non-completed status" : "empty assistant text",
         },
-      ];
+      });
       continue;
     }
     const finalAnswer = answer || "(No response text returned)";
@@ -414,20 +461,114 @@ export async function runOpenAiInferenceStream(
   }
 }
 
-function buildFunctionCallFollowUpInput(
+function buildFunctionCallFollowUpInput(input: {
+  output?: OpenAiOutputItem[];
   functionCalls: Array<{
     type: "function_call";
     call_id: string;
     name: string;
     arguments: string;
-  }>,
+  }>;
   functionOutputs: Array<{
     type: "function_call_output";
     call_id: string;
-    output: string;
-  }>,
-): Array<Record<string, unknown>> {
-  return [...functionCalls, ...functionOutputs];
+    output: OpenAiFunctionCallOutputBody;
+  }>;
+}): Array<Record<string, unknown>> {
+  const followUp: Array<Record<string, unknown>> = [];
+  const callByCallId = new Map(
+    input.functionCalls.map((call) => [call.call_id, call] as const),
+  );
+  const outputByCallId = new Map(
+    input.functionOutputs.map((result) => [result.call_id, result] as const),
+  );
+  const replayedCallIds: string[] = [];
+  const replayedCallIdSet = new Set<string>();
+
+  for (const item of input.output ?? []) {
+    if (item?.type === "message") {
+      const assistantMessage = toAssistantFollowUpMessage(item);
+      if (assistantMessage) {
+        followUp.push(assistantMessage);
+      }
+      continue;
+    }
+
+    if (item?.type === "function_call") {
+      const callId = typeof item.call_id === "string" ? item.call_id.trim() : "";
+      if (!callId) {
+        continue;
+      }
+      const replayCall = callByCallId.get(callId);
+      if (!replayCall) {
+        continue;
+      }
+      followUp.push(replayCall);
+      replayedCallIds.push(callId);
+      replayedCallIdSet.add(callId);
+    }
+  }
+
+  for (const call of input.functionCalls) {
+    if (replayedCallIdSet.has(call.call_id)) {
+      continue;
+    }
+    followUp.push(call);
+    replayedCallIds.push(call.call_id);
+    replayedCallIdSet.add(call.call_id);
+  }
+
+  for (const callId of replayedCallIds) {
+    const replayOutput = outputByCallId.get(callId);
+    if (replayOutput) {
+      followUp.push(replayOutput);
+    }
+  }
+
+  return followUp;
+}
+
+function toAssistantFollowUpMessage(item: {
+  content?: Array<{
+    type?: string;
+    text?: string | { value?: string };
+    value?: string;
+  }>;
+}): Record<string, unknown> | null {
+  if (!Array.isArray(item.content)) {
+    return null;
+  }
+
+  const parts: string[] = [];
+  for (const contentItem of item.content) {
+    const contentType = typeof contentItem?.type === "string" ? contentItem.type : "";
+    if (contentType !== "output_text" && contentType !== "text") {
+      continue;
+    }
+
+    const textField = contentItem.text;
+    const directText = typeof textField === "string" ? textField : "";
+    const nestedValue =
+      textField && typeof textField === "object" && typeof textField.value === "string"
+        ? textField.value
+        : "";
+    const valueField = typeof contentItem.value === "string" ? contentItem.value : "";
+    const text = directText || nestedValue || valueField;
+    if (text.trim()) {
+      parts.push(text.trim());
+    }
+  }
+
+  const content = parts.join("\n\n").trim();
+  if (!content) {
+    return null;
+  }
+
+  return {
+    type: "message",
+    role: "assistant",
+    content,
+  };
 }
 
 function buildToolDeclarations(): {
@@ -556,6 +697,102 @@ function toOpenAiMessageContent(message: ChatMessage): string | Array<Record<str
   return parts;
 }
 
+function computeIncrementalInput(input: {
+  previousResponseId: string | null;
+  requestSignature: string;
+  lastRequestSignature: string | null;
+  fullInput: Array<Record<string, unknown>>;
+  lastRequestInput: Array<Record<string, unknown>>;
+  lastResponseAddedInput: Array<Record<string, unknown>>;
+}): Array<Record<string, unknown>> | null {
+  if (!input.previousResponseId) {
+    return null;
+  }
+  if (!input.lastRequestSignature || input.requestSignature !== input.lastRequestSignature) {
+    return null;
+  }
+  if (input.lastRequestInput.length === 0) {
+    return null;
+  }
+
+  const baseline = [...input.lastRequestInput, ...input.lastResponseAddedInput];
+  if (!isStrictInputExtension(input.fullInput, baseline)) {
+    return null;
+  }
+
+  return input.fullInput.slice(baseline.length);
+}
+
+function isStrictInputExtension(
+  fullInput: Array<Record<string, unknown>>,
+  baseline: Array<Record<string, unknown>>,
+): boolean {
+  if (baseline.length === 0 || baseline.length >= fullInput.length) {
+    return false;
+  }
+  for (let i = 0; i < baseline.length; i += 1) {
+    const baselineItem = baseline[i];
+    const fullItem = fullInput[i];
+    if (safeStableStringify(baselineItem) !== safeStableStringify(fullItem)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function toFunctionCallOutputBody(
+  output: unknown,
+  errorMessage?: string,
+): OpenAiFunctionCallOutputBody {
+  const contentItems = asFunctionCallOutputContentItems(output);
+  if (contentItems) {
+    return contentItems;
+  }
+
+  if (typeof output === "string") {
+    return output;
+  }
+
+  if (output === undefined || output === null) {
+    return errorMessage?.trim() || "";
+  }
+
+  if (output instanceof Error) {
+    return output.message || String(output);
+  }
+
+  return safeStableStringify(output);
+}
+
+function asFunctionCallOutputContentItems(
+  output: unknown,
+): Array<Record<string, unknown>> | null {
+  if (!Array.isArray(output) || output.length === 0) {
+    return null;
+  }
+
+  const items: Array<Record<string, unknown>> = [];
+  for (const entry of output) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return null;
+    }
+    const row = entry as Record<string, unknown>;
+    const type = typeof row.type === "string" ? row.type : "";
+    if (type !== "input_text" && type !== "input_image") {
+      return null;
+    }
+    if (type === "input_text" && typeof row.text !== "string") {
+      return null;
+    }
+    if (type === "input_image" && typeof row.image_url !== "string") {
+      return null;
+    }
+    items.push(row);
+  }
+
+  return items;
+}
+
 function safeParseObject(raw: unknown): Record<string, unknown> {
   if (typeof raw !== "string" || !raw.trim()) {
     return {};
@@ -570,6 +807,57 @@ function safeParseObject(raw: unknown): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+function safeStableStringify(value: unknown): string {
+  if (value === undefined) {
+    return "undefined";
+  }
+  try {
+    return JSON.stringify(value, stableJsonReplacer);
+  } catch {
+    return String(value);
+  }
+}
+
+function stableJsonReplacer(_key: string, value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+
+  const record = value as Record<string, unknown>;
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(record).sort()) {
+    sorted[key] = record[key];
+  }
+  return sorted;
+}
+
+function readOutputItemFromStreamEvent(event: unknown): OpenAiOutputItem | null {
+  const root = asRecord(event);
+  if (!root) {
+    return null;
+  }
+  const item = asRecord(root.item);
+  if (!item) {
+    return null;
+  }
+
+  return item as OpenAiOutputItem;
+}
+
+function pickOutputItemsForFollowUp(
+  outputItemsDone: OpenAiOutputItem[],
+  response: OpenAiResponse,
+): OpenAiOutputItem[] {
+  if (outputItemsDone.length > 0) {
+    return outputItemsDone;
+  }
+  return Array.isArray(response.output) ? response.output : [];
+}
+
+function readTrimmedString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 function extractResponseText(response: {
@@ -648,19 +936,17 @@ function computeUnstreamedAnswerDelta(expectedText: string, streamedText: string
   return "";
 }
 
-function selectActionableFunctionCalls(
-  output: OpenAiResponse["output"] | undefined,
-): Array<NonNullable<OpenAiResponse["output"]>[number]> {
+function selectActionableFunctionCalls(output: OpenAiOutputItem[] | undefined): OpenAiOutputItem[] {
   const calls = (output ?? []).filter((item) => item?.type === "function_call");
   if (calls.length === 0) {
     return [];
   }
 
   const seenSignatures = new Set<string>();
-  const uniqueCalls: Array<NonNullable<OpenAiResponse["output"]>[number]> = [];
+  const uniqueCalls: OpenAiOutputItem[] = [];
   for (const call of calls) {
     const status = typeof call.status === "string" ? call.status.trim().toLowerCase() : "";
-    if (status && status !== "completed") {
+    if (status === "failed" || status === "cancelled") {
       continue;
     }
 
@@ -683,17 +969,26 @@ function selectActionableFunctionCalls(
 async function createResponseWithRetry(
   client: OpenAI,
   requestPayload: Record<string, unknown>,
+  requestHeaders: Record<string, string>,
   toolRound: number,
   onDebug?: (event: DebugEvent) => void,
   onChunk?: (chunk: StreamChunk) => void,
   signal?: AbortSignal,
-): Promise<OpenAiResponse> {
+): Promise<OpenAiStreamResult> {
   let attempt = 0;
   while (true) {
     assertNotAborted(signal);
     attempt += 1;
     try {
-      return await createStreamedResponse(client, requestPayload, toolRound, onDebug, onChunk, signal);
+      return await createStreamedResponse(
+        client,
+        requestPayload,
+        requestHeaders,
+        toolRound,
+        onDebug,
+        onChunk,
+        signal,
+      );
     } catch (error) {
       if (isAbortError(error)) {
         throw error;
@@ -722,23 +1017,44 @@ async function createResponseWithRetry(
 async function createStreamedResponse(
   client: OpenAI,
   requestPayload: Record<string, unknown>,
+  requestHeaders: Record<string, string>,
   toolRound: number,
   onDebug?: (event: DebugEvent) => void,
   onChunk?: (chunk: StreamChunk) => void,
   signal?: AbortSignal,
-): Promise<OpenAiResponse> {
+): Promise<OpenAiStreamResult> {
   assertNotAborted(signal);
-  const stream = signal
-    ? client.responses.stream(requestPayload as never, { signal } as never)
-    : client.responses.stream(requestPayload as never);
+  const requestOptions: Record<string, unknown> = {
+    headers: requestHeaders,
+    stream: true,
+  };
+  if (signal) {
+    requestOptions.signal = signal;
+  }
+  const responsePromise = client.responses.create(requestPayload as never, requestOptions as never);
+  const streamWithResponse = await responsePromise.withResponse();
+  const stream = streamWithResponse.data as unknown as AsyncIterable<any>;
+  const turnStateToken = readTrimmedString(
+    streamWithResponse.response.headers.get("x-codex-turn-state"),
+  );
   let eventCount = 0;
   let outputDeltaChars = 0;
   let reasoningDeltaChars = 0;
   const reasoningSnapshots = new Map<string, string>();
+  const outputItemsDone: OpenAiOutputItem[] = [];
+  let completedEventSeen = false;
+  let finalResponse: OpenAiResponse | null = null;
 
   for await (const event of stream) {
     assertNotAborted(signal);
     eventCount += 1;
+    if (event.type === "response.created") {
+      const createdResponse = asRecord(event.response);
+      if (createdResponse) {
+        finalResponse = createdResponse as OpenAiResponse;
+      }
+      continue;
+    }
 
     if (event.type === "response.output_text.delta") {
       outputDeltaChars += event.delta.length;
@@ -778,6 +1094,23 @@ async function createStreamedResponse(
       continue;
     }
 
+    if (event.type === "response.output_item.done") {
+      const outputItem = readOutputItemFromStreamEvent(event);
+      if (outputItem) {
+        outputItemsDone.push(outputItem);
+      }
+      continue;
+    }
+
+    if (event.type === "response.completed") {
+      completedEventSeen = true;
+      const completedResponse = asRecord(event.response);
+      if (completedResponse) {
+        finalResponse = completedResponse as OpenAiResponse;
+      }
+      continue;
+    }
+
     if (event.type === "error") {
       const message = event.message?.trim() || "unknown stream error";
       throw new Error(`OpenAI stream failed: ${message}`);
@@ -788,8 +1121,9 @@ async function createStreamedResponse(
       throw new Error(`OpenAI response failed: ${message}`);
     }
   }
-
-  const finalResponse = (await stream.finalResponse()) as unknown as OpenAiResponse;
+  if (!finalResponse) {
+    throw new Error("OpenAI stream ended without a response snapshot.");
+  }
   const finalError = finalResponse.error?.message?.trim();
   if (finalError) {
     throw new Error(`OpenAI response failed: ${finalError}`);
@@ -803,10 +1137,16 @@ async function createStreamedResponse(
       outputDeltaChars,
       reasoningDeltaChars,
       responseId: finalResponse.id ?? null,
+      turnStateToken: turnStateToken || null,
     },
   });
 
-  return finalResponse;
+  return {
+    response: finalResponse,
+    outputItemsDone,
+    completedEventSeen,
+    turnStateToken: turnStateToken || null,
+  };
 }
 
 function appendReasoningSnapshot(
@@ -1160,6 +1500,10 @@ function summarizeHttpError(text: string): string {
 }
 
 export const __openAiInternals = {
+  buildFunctionCallFollowUpInput,
+  pickOutputItemsForFollowUp,
+  computeIncrementalInput,
+  toFunctionCallOutputBody,
   computeUnstreamedAnswerDelta,
   extractAnswerDeltaFromChunk,
   extractResponseText,

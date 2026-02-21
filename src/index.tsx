@@ -687,10 +687,13 @@ function App() {
   }, [enabledProviders, openAiAccessToken, openAiAccountId, openRouterApiKey]);
 
   useEffect(() => {
+    if (!secretsHydrated) {
+      return;
+    }
     setSelectedModel((currentModel) =>
       resolveModelForEnabledProviders(selectableModelProviders, currentModel, modelOptionsByProvider),
     );
-  }, [selectableModelProviders, modelOptionsByProvider]);
+  }, [selectableModelProviders, modelOptionsByProvider, secretsHydrated]);
 
   useEffect(() => {
     const provider = findProviderForModel(selectedModel, activeModelOptions);
@@ -2517,6 +2520,7 @@ function App() {
                 thinkingLevel: selectedThinking,
                 includeThoughts: selectedThinking !== "OFF",
                 systemInstruction: runtimeSystemInstruction,
+                sessionId: sessionForTurn?.id,
                 signal: inferenceAbortController.signal,
                 drainSteeringMessages,
               },
@@ -4233,15 +4237,15 @@ function findProviderForModel(
   modelId: string,
   availableModels: ModelOption[],
 ): AuthProvider | null {
-  if (availableModels.length === 0) {
-    return null;
-  }
-
   const direct = availableModels.find((option) => option.id === modelId)?.provider;
   if (direct) {
     return direct;
   }
 
+  return inferProviderFromModelId(modelId);
+}
+
+function inferProviderFromModelId(modelId: string): AuthProvider | null {
   const normalized = modelIdToSlug(modelId).trim().toLowerCase();
   if (!normalized) {
     return null;
