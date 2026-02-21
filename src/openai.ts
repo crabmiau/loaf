@@ -16,6 +16,7 @@ export type OpenAIRequest = {
 };
 
 const CHATGPT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
+const CHATGPT_BACKEND_API_BASE_URL = "https://chatgpt.com/backend-api";
 const OPENAI_MODELS_CLIENT_VERSION = "0.99.0";
 const OPENAI_MODELS_ORIGINATOR = "codex_cli_rs";
 const MAX_429_RETRY_ATTEMPTS = 8;
@@ -58,6 +59,19 @@ export type OpenAiCatalogModel = {
 export type OpenAiCatalogReasoningLevel = {
   effort: string;
   description: string;
+};
+
+export type OpenAiUsageWindow = {
+  usedPercent: number;
+  remainingPercent: number;
+  limitWindowSeconds: number | null;
+  resetAtEpochSeconds: number | null;
+};
+
+export type OpenAiUsageSnapshot = {
+  planType: string | null;
+  primary: OpenAiUsageWindow | null;
+  secondary: OpenAiUsageWindow | null;
 };
 
 export function createChatgptCodexClient(
@@ -119,6 +133,31 @@ export async function listOpenAiCatalogModels(
 
   const json = (await response.json()) as unknown;
   return parseOpenAiCatalogModels(json);
+}
+
+export async function fetchOpenAiUsageSnapshot(
+  accessToken: string,
+  chatgptAccountId: string | null,
+): Promise<OpenAiUsageSnapshot> {
+  const token = accessToken.trim();
+  if (!token) {
+    throw new Error("Missing OpenAI ChatGPT access token.");
+  }
+
+  const response = await fetch(`${CHATGPT_BACKEND_API_BASE_URL}/wham/usage`, {
+    method: "GET",
+    headers: buildOpenAiCatalogHeaders(token, chatgptAccountId),
+  });
+
+  if (!response.ok) {
+    const bodyText = await response.text().catch(() => "");
+    throw new Error(
+      `OpenAI usage fetch failed (${response.status}): ${summarizeHttpError(bodyText)}`,
+    );
+  }
+
+  const json = (await response.json()) as unknown;
+  return parseOpenAiUsageSnapshot(json);
 }
 
 export async function runOpenAiInferenceStream(
@@ -804,6 +843,111 @@ function parseOpenAiCatalogModels(payload: unknown): OpenAiCatalogModel[] {
   }
 
   throw new Error("Unexpected OpenAI models response format.");
+}
+
+function parseOpenAiUsageSnapshot(payload: unknown): OpenAiUsageSnapshot {
+  const root = asRecord(payload);
+  if (!root) {
+    throw new Error("Unexpected OpenAI usage response format.");
+  }
+
+  let primary: OpenAiUsageWindow | null = null;
+  let secondary: OpenAiUsageWindow | null = null;
+
+  const rootRateLimit = asRecord(root.rate_limit);
+  if (rootRateLimit) {
+    primary = parseOpenAiUsageWindow(rootRateLimit.primary_window);
+    secondary = parseOpenAiUsageWindow(rootRateLimit.secondary_window);
+  }
+
+  if (!primary && !secondary) {
+    const additional = Array.isArray(root.additional_rate_limits) ? root.additional_rate_limits : [];
+    for (const entry of additional) {
+      const details = asRecord(entry);
+      if (!details) {
+        continue;
+      }
+      const meteredFeature = typeof details.metered_feature === "string" ? details.metered_feature.trim().toLowerCase() : "";
+      const limitName = typeof details.limit_name === "string" ? details.limit_name.trim().toLowerCase() : "";
+      if (meteredFeature !== "codex" && limitName !== "codex") {
+        continue;
+      }
+      const detailsRateLimit = asRecord(details.rate_limit);
+      if (!detailsRateLimit) {
+        continue;
+      }
+      primary = parseOpenAiUsageWindow(detailsRateLimit.primary_window);
+      secondary = parseOpenAiUsageWindow(detailsRateLimit.secondary_window);
+      break;
+    }
+  }
+
+  const rawPlanType = typeof root.plan_type === "string" ? root.plan_type.trim() : "";
+  return {
+    planType: rawPlanType || null,
+    primary,
+    secondary,
+  };
+}
+
+function parseOpenAiUsageWindow(value: unknown): OpenAiUsageWindow | null {
+  const row = asRecord(value);
+  if (!row) {
+    return null;
+  }
+
+  const usedPercentRaw = toFiniteNumber(row.used_percent);
+  if (usedPercentRaw === null) {
+    return null;
+  }
+  const usedPercent = clampPercent(usedPercentRaw);
+  const limitWindowSeconds = toPositiveIntegerOrNull(row.limit_window_seconds);
+  const resetAtEpochSeconds = toPositiveIntegerOrNull(row.reset_at);
+
+  return {
+    usedPercent,
+    remainingPercent: clampPercent(100 - usedPercent),
+    limitWindowSeconds,
+    resetAtEpochSeconds,
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+  return value;
+}
+
+function toPositiveIntegerOrNull(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+  const floored = Math.floor(value);
+  if (floored <= 0) {
+    return null;
+  }
+  return floored;
+}
+
+function clampPercent(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  if (value < 0) {
+    return 0;
+  }
+  if (value > 100) {
+    return 100;
+  }
+  return value;
 }
 
 function normalizeCatalogId(value: string | undefined): string {

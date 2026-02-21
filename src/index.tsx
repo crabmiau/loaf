@@ -25,7 +25,9 @@ import {
 import {
   antigravityModelToThinkingLevels,
   discoverAntigravityModelOptions,
+  fetchAntigravityUsageSnapshot,
   type AntigravityDiscoveredModel,
+  type AntigravityUsageSnapshot,
 } from "./antigravity-models.js";
 import { runAntigravityInferenceStream } from "./antigravity.js";
 import {
@@ -46,7 +48,7 @@ import {
   modelIdToSlug,
   type ModelOption,
 } from "./models.js";
-import { runOpenAiInferenceStream } from "./openai.js";
+import { fetchOpenAiUsageSnapshot, runOpenAiInferenceStream, type OpenAiUsageSnapshot } from "./openai.js";
 import { listOpenRouterProvidersForModel, runOpenRouterInferenceStream } from "./openrouter.js";
 import { configureBuiltinTools, defaultToolRegistry, loadCustomTools } from "./tools/index.js";
 import type { ChatImageAttachment, ChatMessage, DebugEvent } from "./chat-types.js";
@@ -208,6 +210,7 @@ const COMMAND_OPTIONS: CommandOption[] = [
   { name: "/onboarding", description: "open setup flow (auth + exa key)" },
   { name: "/forgeteverything", description: "wipe local config and restart onboarding" },
   { name: "/model", description: "choose model and thinking level" },
+  { name: "/limits", description: "show oauth usage limits" },
   { name: "/history", description: "resume a saved chat (/history, /history last, /history <id>)" },
   { name: "/skills", description: "list available skills from repo .agents/skills, ~/.loaf/skills, and ~/.agents/skills" },
   { name: "/tools", description: "list registered tools" },
@@ -330,6 +333,8 @@ function App() {
   const queuedPromptsRef = useRef<string[]>([]);
   const [queuedPromptsVersion, setQueuedPromptsVersion] = useState(0);
   const suppressNextSubmitRef = useRef(false);
+  const recentSlashCommandRef = useRef<{ payload: string; at: number } | null>(null);
+  const statusCommandInFlightRef = useRef(false);
   const previousAntigravityModelIdsRef = useRef<Set<string>>(new Set());
   const skipNextAntigravitySyncTokenRef = useRef<string | null>(null);
   const suppressCtrlVEchoRef = useRef<{
@@ -1264,6 +1269,75 @@ function App() {
     resumeSession(byId);
   };
 
+  const runStatusCommand = async () => {
+    if (statusCommandInFlightRef.current) {
+      return;
+    }
+
+    const openAiToken = openAiAccessToken.trim();
+    const hasAnyLimitsProvider = Boolean(openAiToken || antigravityAccessToken);
+    if (!hasAnyLimitsProvider) {
+      appendSystemMessage("limits requires at least one oauth provider. run /auth first.");
+      return;
+    }
+
+    statusCommandInFlightRef.current = true;
+    setPending(true);
+    setStatusLabel("fetching oauth usage...");
+    try {
+      const [openAiResult, antigravityResult] = await Promise.all([
+        openAiToken
+          ? fetchOpenAiUsageSnapshot(openAiToken, openAiAccountId)
+              .then((snapshot) => ({
+                ok: true as const,
+                snapshot,
+              }))
+              .catch((error) => ({
+                ok: false as const,
+                message: error instanceof Error ? error.message : String(error),
+              }))
+          : Promise.resolve(null),
+        antigravityAccessToken
+          ? fetchAntigravityUsageSnapshot({ accessToken: antigravityAccessToken })
+              .then((snapshot) => ({
+                ok: true as const,
+                snapshot,
+              }))
+              .catch((error) => ({
+                ok: false as const,
+                message: error instanceof Error ? error.message : String(error),
+              }))
+          : Promise.resolve(null),
+      ]);
+
+      const outputBlocks: string[] = [];
+      if (openAiResult) {
+        if (openAiResult.ok) {
+          outputBlocks.push(formatOpenAiUsageStatus(openAiResult.snapshot));
+        } else {
+          outputBlocks.push(`codex usage limits failed: ${clipInline(openAiResult.message, 180)}`);
+        }
+      }
+
+      if (antigravityResult) {
+        if (antigravityResult.ok) {
+          outputBlocks.push(formatAntigravityUsageStatus(antigravityResult.snapshot));
+        } else {
+          outputBlocks.push(formatAntigravityUsageFailure(antigravityResult.message));
+        }
+      }
+
+      appendSystemMessage(outputBlocks.join("\n\n"));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      appendSystemMessage(`limits failed: ${clipInline(message, 180)}`);
+    } finally {
+      statusCommandInFlightRef.current = false;
+      setPending(false);
+      setStatusLabel("ready");
+    }
+  };
+
   const applyCommand = (rawCommand: string) => {
     const trimmed = rawCommand.trim();
     if (!trimmed) {
@@ -1328,6 +1402,11 @@ function App() {
 
     if (command === "/model") {
       openModelSelector();
+      return;
+    }
+
+    if (command === "/limits") {
+      void runStatusCommand();
       return;
     }
 
@@ -1408,6 +1487,15 @@ function App() {
       commandToRun === (parts[0] ?? "").toLowerCase()
         ? trimmed
         : [commandToRun, ...parts.slice(1)].join(" ");
+    const now = Date.now();
+    const previous = recentSlashCommandRef.current;
+    if (previous && previous.payload === commandPayload && now - previous.at < 500) {
+      return true;
+    }
+    recentSlashCommandRef.current = {
+      payload: commandPayload,
+      at: now,
+    };
 
     setInput("");
     setInputHistoryIndex(null);
@@ -4033,6 +4121,153 @@ function toThinkingOptions(levels: ThinkingLevel[]): ThinkingOption[] {
     label: THINKING_OPTION_DETAILS[level].label,
     description: THINKING_OPTION_DETAILS[level].description,
   }));
+}
+
+function formatOpenAiUsageStatus(snapshot: OpenAiUsageSnapshot): string {
+  const lines = ["codex usage limits:"];
+  if (snapshot.planType) {
+    lines.push(`plan: ${snapshot.planType}`);
+  }
+  lines.push(formatOpenAiUsageLine("5h", snapshot.primary));
+  lines.push(formatOpenAiUsageLine("weekly", snapshot.secondary));
+  return lines.join("\n");
+}
+
+function formatAntigravityUsageStatus(snapshot: AntigravityUsageSnapshot): string {
+  const lines = ["antigravity usage limits:"];
+  if (snapshot.models.length === 0) {
+    lines.push("models: unavailable");
+    return lines.join("\n");
+  }
+
+  const consolidated = consolidateAntigravityUsageModels(snapshot.models);
+  const sorted = [...consolidated].sort((left, right) => {
+    if (left.remainingPercent !== right.remainingPercent) {
+      return left.remainingPercent - right.remainingPercent;
+    }
+    return left.name.localeCompare(right.name);
+  });
+  const displayRows = sorted.slice(0, 6);
+  for (const quota of displayRows) {
+    lines.push(formatAntigravityUsageLine(quota));
+  }
+  if (sorted.length > displayRows.length) {
+    lines.push(`... +${sorted.length - displayRows.length} more model limits`);
+  }
+  return lines.join("\n");
+}
+
+function formatOpenAiUsageLine(label: string, window: OpenAiUsageSnapshot["primary"]): string {
+  if (!window) {
+    return `${label}: unavailable`;
+  }
+
+  const remaining = `${Math.round(window.remainingPercent)}% remaining`;
+  const used = `${Math.round(window.usedPercent)}% used`;
+  const reset =
+    typeof window.resetAtEpochSeconds === "number"
+      ? `, resets ${formatResetTimestamp(window.resetAtEpochSeconds)}`
+      : "";
+  return `${label}: ${remaining} (${used}${reset})`;
+}
+
+function formatAntigravityUsageLine(modelQuota: AntigravityUsageSnapshot["models"][number]): string {
+  const resetAt = modelQuota.resetTime ? formatResetTimestampString(modelQuota.resetTime) : "unknown";
+  return `${modelQuota.name}: ${modelQuota.remainingPercent}% remaining (resets ${resetAt})`;
+}
+
+function consolidateAntigravityUsageModels(
+  models: AntigravityUsageSnapshot["models"],
+): AntigravityUsageSnapshot["models"] {
+  const groups = new Map<string, AntigravityUsageSnapshot["models"][number][]>();
+
+  for (const model of models) {
+    const normalizedName = model.name.trim().toLowerCase();
+    const key = normalizedName.startsWith("claude")
+      ? "claude"
+      : normalizedName.startsWith("gemini")
+        ? "gemini"
+        : model.name;
+    const existing = groups.get(key);
+    if (existing) {
+      existing.push(model);
+    } else {
+      groups.set(key, [model]);
+    }
+  }
+
+  const consolidated: AntigravityUsageSnapshot["models"] = [];
+  for (const [name, group] of groups) {
+    const remainingPercent = group.reduce((min, row) => Math.min(min, row.remainingPercent), 100);
+    consolidated.push({
+      name,
+      remainingPercent,
+      resetTime: pickEarliestResetTime(group),
+    });
+  }
+
+  return consolidated;
+}
+
+function pickEarliestResetTime(group: AntigravityUsageSnapshot["models"]): string | null {
+  let earliest: { raw: string; epochMs: number } | null = null;
+  let fallbackRaw: string | null = null;
+
+  for (const row of group) {
+    const raw = row.resetTime?.trim() ?? "";
+    if (!raw) {
+      continue;
+    }
+    if (!fallbackRaw) {
+      fallbackRaw = raw;
+    }
+    const epochMs = Date.parse(raw);
+    if (!Number.isFinite(epochMs)) {
+      continue;
+    }
+    if (!earliest || epochMs < earliest.epochMs) {
+      earliest = { raw, epochMs };
+    }
+  }
+
+  return earliest?.raw ?? fallbackRaw;
+}
+
+function formatAntigravityUsageFailure(rawMessage: string): string {
+  const message = rawMessage.trim() || "unknown error";
+  const cloudCodeStatus = extractCloudCodeStatus(message);
+  const enableApiUrl = extractGoogleApiEnableUrl(message);
+  const projectId = extractGoogleProjectId(message, enableApiUrl);
+
+  if (isAntigravityApiDisabledError(message)) {
+    const projectSuffix = projectId ? ` for project ${projectId}` : "";
+    if (enableApiUrl) {
+      return `antigravity usage limits blocked: cloud code api is disabled${projectSuffix}.\nenable antigravity cloud code api: ${enableApiUrl}`;
+    }
+    return `antigravity usage limits blocked: cloud code api is disabled${projectSuffix}.`;
+  }
+
+  if (cloudCodeStatus) {
+    return `antigravity usage limits failed (cloudcode ${cloudCodeStatus}).`;
+  }
+
+  return `antigravity usage limits failed: ${clipInline(message.replace(/\s+/g, " ").trim(), 180)}`;
+}
+
+function formatResetTimestamp(epochSeconds: number): string {
+  const date = new Date(epochSeconds * 1000);
+  if (Number.isNaN(date.getTime())) {
+    return "unknown";
+  }
+  return date.toLocaleString();
+}
+
+function formatResetTimestampString(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "unknown";
+  }
+  return date.toLocaleString();
 }
 
 function MarkdownText({ text, prefix = "" }: { text: string; prefix?: string }) {

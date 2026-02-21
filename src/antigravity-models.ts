@@ -44,6 +44,10 @@ type AntigravityModelDetails = {
   supportsImages?: boolean;
   thinkingBudget?: number;
   minThinkingBudget?: number;
+  quotaInfo?: {
+    remainingFraction?: number;
+    resetTime?: string;
+  };
   disabled?: boolean;
   beta?: boolean;
   preview?: boolean;
@@ -64,6 +68,17 @@ export type AntigravityDiscoveredModel = {
 export type AntigravityModelsDiscoveryResult = {
   models: AntigravityDiscoveredModel[];
   source: "remote";
+};
+
+export type AntigravityUsageModelQuota = {
+  name: string;
+  remainingPercent: number;
+  resetTime: string | null;
+};
+
+export type AntigravityUsageSnapshot = {
+  projectId: string;
+  models: AntigravityUsageModelQuota[];
 };
 
 export async function discoverAntigravityModelOptions(request: {
@@ -95,6 +110,42 @@ export async function discoverAntigravityModelOptions(request: {
   return {
     models: normalizeAntigravityModels(fetchResponse),
     source: "remote",
+  };
+}
+
+export async function fetchAntigravityUsageSnapshot(request: {
+  accessToken: string;
+}): Promise<AntigravityUsageSnapshot> {
+  const accessToken = request.accessToken.trim();
+  if (!accessToken) {
+    throw new Error("Missing Antigravity OAuth token.");
+  }
+
+  const metadata = buildCloudCodeMetadata();
+  const loadCodeAssist = await callCloudCode<LoadCodeAssistResponse>({
+    accessToken,
+    baseUrl: CLOUD_CODE_BASE_URL_STABLE,
+    path: "v1internal:loadCodeAssist",
+    body: { metadata },
+  });
+
+  const project = loadCodeAssist.cloudaicompanionProject?.trim() ?? "";
+  if (!project) {
+    throw new Error("antigravity project resolution failed. try /auth antigravity oauth again.");
+  }
+
+  const isGcpTos = loadCodeAssist.currentTier?.usesGcpTos === true;
+  const baseUrl = isGcpTos ? CLOUD_CODE_BASE_URL_GCP_TOS : CLOUD_CODE_BASE_URL_STABLE;
+  const fetchResponse = await callCloudCode<FetchAvailableModelsResponse>({
+    accessToken,
+    baseUrl,
+    path: "v1internal:fetchAvailableModels",
+    body: { project },
+  });
+
+  return {
+    projectId: project,
+    models: normalizeAntigravityUsageModels(fetchResponse),
   };
 }
 
@@ -147,6 +198,45 @@ function normalizeAntigravityModels(response: FetchAvailableModelsResponse): Ant
       supportsImages: details.supportsImages === true,
       thinkingBudget: toFiniteNumber(details.thinkingBudget),
       minThinkingBudget: toFiniteNumber(details.minThinkingBudget),
+    });
+  }
+
+  return rows;
+}
+
+function normalizeAntigravityUsageModels(response: FetchAvailableModelsResponse): AntigravityUsageModelQuota[] {
+  const modelMap = response.models ?? {};
+  const orderedIds = getOrderedModelIds(response, modelMap);
+  const rows: AntigravityUsageModelQuota[] = [];
+
+  for (const id of orderedIds) {
+    const details = modelMap[id];
+    const name = id.trim();
+    if (!name || !details) {
+      continue;
+    }
+    if (
+      !name.includes("claude") &&
+      !name.includes("gemini") &&
+      !name.includes("image") &&
+      !name.includes("imagen")
+    ) {
+      continue;
+    }
+
+    const quotaInfo = details.quotaInfo;
+    const remainingFraction =
+      typeof quotaInfo?.remainingFraction === "number" && Number.isFinite(quotaInfo.remainingFraction)
+        ? quotaInfo.remainingFraction
+        : null;
+    if (remainingFraction === null) {
+      continue;
+    }
+
+    rows.push({
+      name,
+      remainingPercent: clampPercent(Math.round(remainingFraction * 100)),
+      resetTime: typeof quotaInfo?.resetTime === "string" && quotaInfo.resetTime.trim() ? quotaInfo.resetTime : null,
     });
   }
 
@@ -218,6 +308,19 @@ function inferDefaultThinkingLevel(model: AntigravityDiscoveredModel): ThinkingL
 
 function toFiniteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function clampPercent(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  if (value <= 0) {
+    return 0;
+  }
+  if (value >= 100) {
+    return 100;
+  }
+  return value;
 }
 
 function buildCloudCodeMetadata(): CloudCodeMetadata {
