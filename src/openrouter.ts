@@ -211,6 +211,7 @@ export async function runOpenRouterInferenceStream(
       onChunk?.({
         thoughts: [thought],
         answerText: "",
+        segments: [{ kind: "thought", text: thought }],
       });
     }
 
@@ -296,6 +297,7 @@ export async function runOpenRouterInferenceStream(
     onChunk?.({
       thoughts: [],
       answerText: answer,
+      segments: [{ kind: "answer", text: answer }],
     });
 
     onDebug?.({

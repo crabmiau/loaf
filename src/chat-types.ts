@@ -16,9 +16,15 @@ export type ModelResult = {
   answer: string;
 };
 
+export type StreamSegment = {
+  kind: "thought" | "answer";
+  text: string;
+};
+
 export type StreamChunk = {
   thoughts: string[];
   answerText: string;
+  segments?: StreamSegment[];
 };
 
 export type DebugEvent = {

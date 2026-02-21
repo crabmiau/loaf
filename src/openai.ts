@@ -346,6 +346,7 @@ export async function runOpenAiInferenceStream(
       onChunk({
         thoughts: [],
         answerText: finalAnswer,
+        segments: [{ kind: "answer", text: finalAnswer }],
       });
     }
 
@@ -613,7 +614,7 @@ async function createStreamedResponse(
   let eventCount = 0;
   let outputDeltaChars = 0;
   let reasoningDeltaChars = 0;
-  let reasoningBuffer = "";
+  const reasoningSnapshots = new Map<string, string>();
 
   for await (const event of stream) {
     assertNotAborted(signal);
@@ -625,22 +626,34 @@ async function createStreamedResponse(
         onChunk?.({
           thoughts: [],
           answerText: event.delta,
+          segments: [{ kind: "answer", text: event.delta }],
         });
       }
       continue;
     }
 
     if (event.type === "response.reasoning_text.delta") {
-      reasoningDeltaChars += event.delta.length;
-      if (event.delta) {
-        reasoningBuffer += event.delta;
-        const snapshot = reasoningBuffer.trim();
-        if (snapshot) {
-          onChunk?.({
-            thoughts: [snapshot],
-            answerText: "",
-          });
-        }
+      const snapshot = appendReasoningSnapshot(reasoningSnapshots, event, "content_index");
+      if (snapshot && event.delta) {
+        reasoningDeltaChars += event.delta.length;
+        onChunk?.({
+          thoughts: [snapshot],
+          answerText: "",
+          segments: [{ kind: "thought", text: event.delta }],
+        });
+      }
+      continue;
+    }
+
+    if (event.type === "response.reasoning_summary_text.delta") {
+      const snapshot = appendReasoningSnapshot(reasoningSnapshots, event, "summary_index");
+      if (snapshot && event.delta) {
+        reasoningDeltaChars += event.delta.length;
+        onChunk?.({
+          thoughts: [snapshot],
+          answerText: "",
+          segments: [{ kind: "thought", text: event.delta }],
+        });
       }
       continue;
     }
@@ -674,6 +687,26 @@ async function createStreamedResponse(
   });
 
   return finalResponse;
+}
+
+function appendReasoningSnapshot(
+  snapshots: Map<string, string>,
+  event: { delta?: string; item_id?: string; content_index?: number; summary_index?: number },
+  indexKind: "content_index" | "summary_index",
+): string | null {
+  const delta = typeof event.delta === "string" ? event.delta : "";
+  if (!delta) {
+    return null;
+  }
+
+  const itemId = typeof event.item_id === "string" && event.item_id.trim() ? event.item_id.trim() : "unknown";
+  const indexValueRaw = event[indexKind];
+  const indexValue = typeof indexValueRaw === "number" ? indexValueRaw : 0;
+  const key = `${itemId}:${indexKind}:${indexValue}`;
+  const next = (snapshots.get(key) ?? "") + delta;
+  snapshots.set(key, next);
+  const snapshot = next.trim();
+  return snapshot || null;
 }
 
 function isRetryable429Error(error: unknown): boolean {

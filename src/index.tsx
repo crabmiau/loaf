@@ -51,7 +51,7 @@ import {
 import { fetchOpenAiUsageSnapshot, runOpenAiInferenceStream, type OpenAiUsageSnapshot } from "./openai.js";
 import { listOpenRouterProvidersForModel, runOpenRouterInferenceStream } from "./openrouter.js";
 import { configureBuiltinTools, defaultToolRegistry, loadCustomTools } from "./tools/index.js";
-import type { ChatImageAttachment, ChatMessage, DebugEvent } from "./chat-types.js";
+import type { ChatImageAttachment, ChatMessage, DebugEvent, StreamChunk } from "./chat-types.js";
 import {
   buildSkillPromptContext,
   loadSkillsCatalog,
@@ -292,6 +292,7 @@ function App() {
   const [autocompletedSkillPrefix, setAutocompletedSkillPrefix] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const [statusLabel, setStatusLabel] = useState("ready");
+  const [startupStatusLabel, setStartupStatusLabel] = useState("initializing...");
   const [superDebug, setSuperDebug] = useState(false);
   const [secretsHydrated, setSecretsHydrated] = useState(false);
   const [onboardingCompleted, setOnboardingCompleted] = useState<boolean>(initialOnboardingCompleted);
@@ -474,6 +475,7 @@ function App() {
 
     void (async () => {
       try {
+        setStartupStatusLabel("loading saved secrets...");
         const runtimeSecrets = await loadPersistedRuntimeSecrets(persistedState);
         if (cancelled) {
           return;
@@ -487,6 +489,7 @@ function App() {
           setExaApiKey(runtimeSecrets.exaApiKey);
         }
 
+        setStartupStatusLabel("loading oauth sessions...");
         const openAiAuth = await loadPersistedOpenAiChatgptAuth();
         if (!cancelled && openAiAuth?.accessToken.trim()) {
           setOpenAiAccessToken(openAiAuth.accessToken);
@@ -496,14 +499,46 @@ function App() {
 
         const antigravityTokenInfo = await loadPersistedAntigravityOauthTokenInfo();
         if (!cancelled && antigravityTokenInfo) {
+          const accessToken = antigravityTokenInfo.accessToken.trim();
+          if (accessToken) {
+            // Skip first token-triggered sync effect; bootstrap handles startup sync directly.
+            skipNextAntigravitySyncTokenRef.current = accessToken;
+          }
+
+          setStartupStatusLabel("restoring antigravity session...");
           setAntigravityOauthTokenInfo(antigravityTokenInfo);
-          const profile = await fetchAntigravityProfileData(antigravityTokenInfo.accessToken);
-          if (!cancelled) {
-            setAntigravityOauthProfile(profile);
+          try {
+            const profile = await fetchAntigravityProfileData(antigravityTokenInfo.accessToken);
+            if (!cancelled) {
+              setAntigravityOauthProfile(profile);
+            }
+          } catch {
+            if (!cancelled) {
+              setAntigravityOauthProfile(null);
+            }
+          }
+
+          if (accessToken) {
+            setStartupStatusLabel("syncing antigravity models...");
+            try {
+              const result = await discoverAntigravityModelOptions({
+                accessToken,
+              });
+              if (!cancelled) {
+                setAntigravityOpenAiModelOptions(toAntigravityOpenAiModelOptions(result.models));
+              }
+            } catch (error) {
+              if (!cancelled) {
+                setAntigravityOpenAiModelOptions([]);
+                const message = error instanceof Error ? error.message : String(error);
+                appendAntigravityModelSyncFailureMessages(appendSystemMessage, message);
+              }
+            }
           }
         }
       } finally {
         if (!cancelled) {
+          setStartupStatusLabel("ready");
           setSecretsHydrated(true);
         }
       }
@@ -1554,6 +1589,9 @@ function App() {
       exit();
       return;
     }
+    if (!secretsHydrated) {
+      return;
+    }
 
     if (!selector && isImageAttachKeybind(character, key)) {
       if (suppressCtrlVEchoRef.current.timeout) {
@@ -1581,16 +1619,50 @@ function App() {
       return;
     }
 
-    if (!selector && pending && key.return && key.shift) {
+    if (!selector && pending && key.return) {
+      // Some terminals don't reliably set key.shift for Enter variants.
+      // Treat LF (`\n`) Enter as steer as a compatibility fallback.
+      const isSteerEnter = key.shift || character === "\n";
       const trimmed = input.trim();
-      if (!trimmed) {
-        appendSystemMessage("enter a steer message first, then press shift+enter.");
+
+      if (!activeInferenceAbortControllerRef.current) {
+        appendSystemMessage("busy. wait for current operation to finish.");
         suppressNextSubmitRef.current = true;
         return;
       }
 
-      const steerText = parseSteerCommand(trimmed) ?? trimmed;
-      queueSteeringMessage(steerText);
+      if (!trimmed) {
+        appendSystemMessage(
+          isSteerEnter
+            ? "enter a steer message first, then press shift+enter."
+            : "cannot queue an empty prompt while running.",
+        );
+        suppressNextSubmitRef.current = true;
+        return;
+      }
+
+      if (isSteerEnter) {
+        const steerText = parseSteerCommand(trimmed) ?? trimmed;
+        queueSteeringMessage(steerText);
+        suppressNextSubmitRef.current = true;
+        return;
+      }
+
+      const pendingCommand = trimmed.split(/\s+/)[0]?.toLowerCase();
+      if (pendingCommand === "/quit" || pendingCommand === "/exit") {
+        suppressNextSubmitRef.current = true;
+        exit();
+        return;
+      }
+      if (trimmed.startsWith("/")) {
+        appendSystemMessage(
+          "slash commands cannot be queued while running. use esc to interrupt first.",
+        );
+        suppressNextSubmitRef.current = true;
+        return;
+      }
+
+      queuePendingPrompt(trimmed);
       suppressNextSubmitRef.current = true;
       return;
     }
@@ -2194,7 +2266,30 @@ function App() {
     };
 
     try {
-      const handleChunk = (chunk: { thoughts: string[]; answerText: string }) => {
+      const handleChunk = (chunk: StreamChunk) => {
+        const segments = Array.isArray(chunk.segments) ? chunk.segments : [];
+        if (segments.length > 0) {
+          let thoughtIndex = 0;
+          for (const segment of segments) {
+            if (segment.kind === "thought") {
+              const thoughtText =
+                chunk.thoughts[thoughtIndex] ??
+                chunk.thoughts[chunk.thoughts.length - 1] ??
+                segment.text;
+              thoughtIndex += 1;
+              const title = parseThoughtTitle(thoughtText);
+              setStatusLabel(`thinking: ${title}`);
+              continue;
+            }
+
+            if (segment.kind === "answer" && segment.text) {
+              appendAssistantDraftDelta(segment.text);
+              setStatusLabel("drafting response...");
+            }
+          }
+          return;
+        }
+
         for (const rawThought of chunk.thoughts) {
           const title = parseThoughtTitle(rawThought);
           setStatusLabel(`thinking: ${title}`);
@@ -2384,6 +2479,21 @@ function App() {
     setQueuedPromptsVersion((current) => current + 1);
     void sendPrompt(nextQueuedPrompt);
   }, [pending, queuedPromptsVersion]);
+
+  if (!secretsHydrated) {
+    return (
+      <Box flexDirection="column" paddingX={1}>
+        <Text color="cyanBright">loaf | beta</Text>
+        <Text color="yellow">
+          {GLYPH_SYSTEM}
+          starting...
+        </Text>
+        <Text color="gray">{startupStatusLabel}</Text>
+        <Newline />
+        <Text color="gray">{exitShortcutLabel} exit</Text>
+      </Box>
+    );
+  }
 
   return (
     <Box flexDirection="column" paddingX={1}>
