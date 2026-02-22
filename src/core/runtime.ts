@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import fs from "node:fs";
+import os from "node:os";
+import { spawnSync } from "node:child_process";
 import { loafConfig, type AuthProvider, type ThinkingLevel } from "../config.js";
 import {
   clearPersistedConfig,
@@ -53,6 +56,36 @@ import {
   normalizeRuntimeImageInputs,
   type RuntimeImageInput,
 } from "./images.js";
+import {
+  backfillEventsFromHistory,
+  createCompactEvent,
+} from "../compaction/events.js";
+import {
+  buildModelContextMessages,
+  runAnchoredCompaction,
+  type AnchoredCompactionResult,
+  type CompactionReason,
+} from "../compaction/engine.js";
+import {
+  deriveCompactionSidecarPaths,
+  appendCompactionEvents,
+  loadCompactionEvents,
+  loadCompactionState,
+  overwriteCompactionEvents,
+  saveCompactionState,
+  saveCompactionSummaryMirror,
+} from "../compaction/storage.js";
+import {
+  summarizeDeltaWithModel,
+  type StructuredSummaryModelCall,
+} from "../compaction/summarizer.js";
+import type {
+  CompactEvent,
+  CompactionPersistedState,
+  CompactionSidecarPaths,
+  SummaryState,
+} from "../compaction/types.js";
+import { LOAF_EASTER_EGG_IMAGE_B64 } from "./loaf-easter-egg-image.js";
 
 export type RuntimeUiMessage = {
   id: number;
@@ -80,6 +113,15 @@ export type RuntimeSessionState = {
   pendingSteerCount: number;
   conversationProvider: AuthProvider | null;
   activeSessionId: string | null;
+  contextTokenEstimate: number;
+  contextTokenSource: "compaction" | "history";
+  contextTokenProvider: AuthProvider | null;
+  contextTokenBreakdown: {
+    pinned_tokens: number;
+    conversation_tokens: number;
+    tool_schema_tokens: number;
+    provider_overhead_tokens: number;
+  };
 };
 
 export type RuntimeEvent = {
@@ -131,6 +173,15 @@ type RuntimeSession = {
   queuedPrompts: RuntimeTurnQueueItem[];
   steeringQueue: ChatMessage[];
   activeAbortController: AbortController | null;
+  compaction: SessionCompactionCache | null;
+};
+
+type SessionCompactionCache = {
+  rolloutPath: string;
+  paths: CompactionSidecarPaths;
+  state: CompactionPersistedState;
+  events: CompactEvent[];
+  nextIndex: number;
 };
 
 const OPENROUTER_PROVIDER_ANY_ID = "any";
@@ -165,14 +216,21 @@ const OS_PROMPT_EXTENSION = buildOsPromptExtension();
 const DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS = 272_000;
 const MIN_MODEL_CONTEXT_WINDOW_TOKENS = 8_000;
 const MAX_MODEL_CONTEXT_WINDOW_TOKENS = 2_000_000;
-const AUTO_COMPRESSION_CONTEXT_PERCENT = 95;
+const AUTO_COMPRESSION_CONTEXT_PERCENT = 82;
 const MIN_AUTO_COMPRESSION_TOKEN_LIMIT = 6_000;
-const MAX_COMPRESSION_SUMMARY_ENTRIES = 16;
-const MAX_COMPRESSION_SUMMARY_LINE_CHARS = 240;
-const MAX_COMPRESSION_SUMMARY_TOTAL_CHARS = 3_600;
 const APPROX_HISTORY_TOKENS_PER_CHAR = 4;
 const APPROX_HISTORY_MESSAGE_OVERHEAD_TOKENS = 20;
 const APPROX_HISTORY_IMAGE_TOKENS = 850;
+const TOOL_SCHEMA_PER_TOOL_OVERHEAD_TOKENS: Record<AuthProvider, number> = {
+  openai: 18,
+  openrouter: 18,
+  antigravity: 24,
+};
+const PROVIDER_REQUEST_OVERHEAD_TOKENS: Record<AuthProvider, number> = {
+  openai: 42,
+  openrouter: 48,
+  antigravity: 58,
+};
 
 export class LoafCoreRuntime {
   private readonly rpcMode: boolean;
@@ -240,6 +298,7 @@ export class LoafCoreRuntime {
       session.statusLabel = "ready";
       session.queuedPrompts = [];
       session.steeringQueue = [];
+      session.compaction = null;
     }
 
     this.emit("state.changed", {
@@ -386,103 +445,6 @@ export class LoafCoreRuntime {
     return (this.antigravityOauthTokenInfo?.accessToken ?? "").trim().length > 0;
   }
 
-  private compressSessionHistory(params: {
-    session: RuntimeSession;
-    reason: "manual" | "auto" | "provider_switch";
-    fromProvider?: AuthProvider | null;
-    toProvider?: AuthProvider;
-    contextWindowTokens: number;
-    tokenLimit: number;
-    estimatedBeforeTokens?: number;
-  }): {
-    applied: boolean;
-    estimatedBeforeTokens: number;
-    estimatedAfterTokens: number;
-    summary: string;
-  } {
-    const previousHistory = params.session.history;
-    const estimatedBeforeTokens = params.estimatedBeforeTokens ?? estimateHistoryTokens(previousHistory);
-    if (previousHistory.length === 0) {
-      return {
-        applied: false,
-        estimatedBeforeTokens,
-        estimatedAfterTokens: estimatedBeforeTokens,
-        summary: "",
-      };
-    }
-
-    const initialKeepRecent = params.reason === "provider_switch" ? 4 : 8;
-    let keepRecentCount = Math.max(1, Math.min(initialKeepRecent, previousHistory.length));
-    let recent = previousHistory.slice(-keepRecentCount);
-    let summarySource = previousHistory.slice(0, Math.max(0, previousHistory.length - keepRecentCount));
-
-    // Ensure provider switches always produce a real compression (not just a no-op summary).
-    if (params.reason === "provider_switch" && summarySource.length === 0 && previousHistory.length > 1) {
-      keepRecentCount = 1;
-      recent = previousHistory.slice(-keepRecentCount);
-      summarySource = previousHistory.slice(0, previousHistory.length - keepRecentCount);
-    }
-
-    if (summarySource.length === 0) {
-      summarySource = previousHistory.slice(0, 1);
-      recent = previousHistory.slice(1);
-    }
-
-    const summary = buildCompressionSummaryText({
-      reason: params.reason,
-      modelId: this.selectedModel,
-      contextWindowTokens: params.contextWindowTokens,
-      tokenLimit: params.tokenLimit,
-      summarySource,
-    });
-    const compressedHistory: ChatMessage[] = [
-      {
-        role: "assistant",
-        text: summary,
-      },
-      ...recent,
-    ];
-
-    params.session.history = compressedHistory;
-    params.session.activeSession = null;
-    params.session.updatedAt = new Date().toISOString();
-    if (params.reason === "provider_switch" && params.toProvider) {
-      params.session.conversationProvider = params.toProvider;
-    }
-
-    this.appendSessionMessage(params.session, {
-      id: this.nextUiMessageId(),
-      kind: "assistant",
-      text: summary,
-    });
-
-    const estimatedAfterTokens = estimateHistoryTokens(compressedHistory);
-    if (params.reason === "provider_switch" && params.toProvider) {
-      const fromLabel = params.fromProvider ?? "unknown";
-      this.appendSystemMessage(
-        params.session,
-        `provider switched: ${fromLabel} -> ${params.toProvider}. context compressed (${formatTokenCount(estimatedBeforeTokens)} -> ${formatTokenCount(estimatedAfterTokens)} est. tokens).`,
-      );
-    } else if (params.reason === "auto") {
-      this.appendSystemMessage(
-        params.session,
-        `context compression (auto): ${formatTokenCount(estimatedBeforeTokens)} -> ${formatTokenCount(estimatedAfterTokens)} est. tokens (limit ${formatTokenCount(params.tokenLimit)} / window ${formatTokenCount(params.contextWindowTokens)}).`,
-      );
-    } else {
-      this.appendSystemMessage(
-        params.session,
-        `context compression complete: ${formatTokenCount(estimatedBeforeTokens)} -> ${formatTokenCount(estimatedAfterTokens)} est. tokens.`,
-      );
-    }
-
-    return {
-      applied: true,
-      estimatedBeforeTokens,
-      estimatedAfterTokens,
-      summary,
-    };
-  }
-
   private appendSessionMessage(session: RuntimeSession, message: RuntimeUiMessage): void {
     session.messages.push(message);
     session.updatedAt = new Date().toISOString();
@@ -504,6 +466,382 @@ export class LoafCoreRuntime {
     const id = this.nextMessageId;
     this.nextMessageId += 1;
     return id;
+  }
+
+  private ensureCompactionCache(session: RuntimeSession, provider: AuthProvider): SessionCompactionCache {
+    if (!session.activeSession) {
+      session.activeSession = createChatSession({
+        provider: session.conversationProvider ?? provider,
+        model: this.selectedModel,
+        thinkingLevel: this.selectedThinking,
+        openRouterProvider:
+          provider === "openrouter" ? normalizeOpenRouterProviderSelection(this.selectedOpenRouterProvider) : undefined,
+        titleHint: session.messages.find((message) => message.kind === "user")?.text,
+      });
+    }
+
+    const rolloutPath = session.activeSession.rolloutPath;
+    if (session.compaction && session.compaction.rolloutPath === rolloutPath) {
+      return session.compaction;
+    }
+
+    const paths = deriveCompactionSidecarPaths(rolloutPath);
+    const state = loadCompactionState(paths);
+    let events = loadCompactionEvents(paths);
+
+    if (events.length === 0 && session.history.length > 0) {
+      const backfilledEvents = backfillEventsFromHistory({
+        history: session.history,
+        startIndex: 0,
+        provider: session.conversationProvider ?? provider,
+      });
+      if (backfilledEvents.length > 0) {
+        appendCompactionEvents(paths, backfilledEvents);
+        events = backfilledEvents;
+      }
+      state.backfilled_from_rollout = true;
+      state.updated_at_iso = new Date().toISOString();
+      saveCompactionState(paths, state);
+      saveCompactionSummaryMirror(paths, state.summary_state);
+    }
+
+    const maxEventIndex = events.length > 0 ? events[events.length - 1]!.index : -1;
+    const nextIndex = maxEventIndex + 1;
+    const normalizedAnchor = Math.max(0, Math.min(state.last_anchor_event_index, Math.max(0, nextIndex)));
+    if (normalizedAnchor !== state.last_anchor_event_index) {
+      state.last_anchor_event_index = normalizedAnchor;
+      state.updated_at_iso = new Date().toISOString();
+      saveCompactionState(paths, state);
+    }
+
+    const cache: SessionCompactionCache = {
+      rolloutPath,
+      paths,
+      state,
+      events,
+      nextIndex,
+    };
+    session.compaction = cache;
+    return cache;
+  }
+
+  private persistCompactionCache(cache: SessionCompactionCache): void {
+    cache.state.updated_at_iso = new Date().toISOString();
+    saveCompactionState(cache.paths, cache.state);
+    saveCompactionSummaryMirror(cache.paths, cache.state.summary_state);
+  }
+
+  private migrateCompactionCacheToRollout(session: RuntimeSession, nextRolloutPath: string): void {
+    const cache = session.compaction;
+    if (!cache || !nextRolloutPath.trim() || cache.rolloutPath === nextRolloutPath) {
+      return;
+    }
+
+    try {
+      const nextPaths = deriveCompactionSidecarPaths(nextRolloutPath);
+      overwriteCompactionEvents(nextPaths, cache.events);
+      saveCompactionState(nextPaths, cache.state);
+      saveCompactionSummaryMirror(nextPaths, cache.state.summary_state);
+      cache.rolloutPath = nextRolloutPath;
+      cache.paths = nextPaths;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit("session.debug", {
+        session_id: session.id,
+        stage: "compaction.migration_failed",
+        data: {
+          from_rollout: cache.rolloutPath,
+          to_rollout: nextRolloutPath,
+          message,
+        },
+      });
+    }
+  }
+
+  private appendCompactionEvent(params: {
+    session: RuntimeSession;
+    provider: AuthProvider;
+    type: CompactEvent["type"];
+    turnId?: string;
+    payload?: Record<string, unknown>;
+    cache?: SessionCompactionCache;
+  }): CompactEvent {
+    const cache = params.cache ?? this.ensureCompactionCache(params.session, params.provider);
+    const event = createCompactEvent({
+      index: cache.nextIndex,
+      type: params.type,
+      payload: params.payload,
+      provider: params.provider,
+      turnId: params.turnId,
+      atIso: new Date().toISOString(),
+    });
+    cache.nextIndex += 1;
+    cache.events.push(event);
+    appendCompactionEvents(cache.paths, [event]);
+    const estimate = this.estimateSessionContextTokens(params.session);
+    this.emit("session.context.estimate", {
+      session_id: params.session.id,
+      provider: estimate.provider,
+      source: estimate.source,
+      total_tokens_estimate: estimate.total,
+      breakdown: estimate.breakdown,
+    });
+    return event;
+  }
+
+  private appendCompactionEventSafe(params: {
+    session: RuntimeSession;
+    provider: AuthProvider;
+    type: CompactEvent["type"];
+    turnId?: string;
+    payload?: Record<string, unknown>;
+    cache?: SessionCompactionCache;
+  }): void {
+    try {
+      this.appendCompactionEvent(params);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit("session.debug", {
+        session_id: params.session.id,
+        turn_id: params.turnId,
+        stage: "compaction.event_append_failed",
+        data: {
+          type: params.type,
+          message,
+        },
+      });
+    }
+  }
+
+  private async runSessionCompaction(params: {
+    session: RuntimeSession;
+    provider: AuthProvider;
+    reason: CompactionReason;
+    contextWindowTokens: number;
+    force: boolean;
+    turnId?: string;
+    pinnedInstruction: string;
+  }): Promise<AnchoredCompactionResult> {
+    const cache = this.ensureCompactionCache(params.session, params.provider);
+    const anchorBefore = cache.state.last_anchor_event_index;
+    this.emit("compaction.started", {
+      session_id: params.session.id,
+      turn_id: params.turnId,
+      reason: params.reason,
+      anchor_event_index_before: anchorBefore,
+      event_count: cache.events.length,
+      context_window_tokens: params.contextWindowTokens,
+    });
+
+    try {
+      const modelCall: StructuredSummaryModelCall = async ({ systemInstruction, messages }) =>
+        this.runSummaryModelInference({
+          provider: params.provider,
+          systemInstruction,
+          messages,
+        });
+
+      const result = await runAnchoredCompaction({
+        reason: params.reason,
+        events: cache.events,
+        lastAnchorEventIndex: anchorBefore,
+        summaryState: cache.state.summary_state,
+        modelContextWindowTokens: params.contextWindowTokens,
+        pinnedTokenEstimate: estimatePinnedInstructionTokens(params.pinnedInstruction),
+        estimateHistoryTokens: estimateHistoryTokens,
+        summarizeDelta: ({ oldSummaryState, deltaEvents }) =>
+          summarizeDeltaWithModel({
+            callModel: modelCall,
+            oldSummaryState,
+            deltaEvents,
+          }),
+        force: params.force,
+      });
+
+      this.emit("compaction.anchor_selected", {
+        session_id: params.session.id,
+        turn_id: params.turnId,
+        reason: result.reason,
+        anchor_event_index_before: result.anchor_event_index_before,
+        anchor_event_index_after: result.anchor_event_index_after,
+        delta_event_count: result.delta_event_count,
+      });
+
+      if (result.compressed) {
+        cache.state.last_anchor_event_index = result.anchor_event_index_after;
+        cache.state.summary_state = result.summary_state;
+        this.persistCompactionCache(cache);
+        this.emit("compaction.summary_merged", {
+          session_id: params.session.id,
+          turn_id: params.turnId,
+          summary_updated_at: cache.state.summary_state.updated_at_iso,
+          anchor_event_index_after: cache.state.last_anchor_event_index,
+        });
+      }
+
+      this.emit("compaction.completed", {
+        session_id: params.session.id,
+        turn_id: params.turnId,
+        compressed: result.compressed,
+        reason: result.reason,
+        estimated_tokens_before: result.estimated_tokens_before,
+        estimated_tokens_after: result.estimated_tokens_after,
+        model_context_window: result.model_context_window,
+        target_limit: result.target_limit,
+        high_watermark_limit: result.high_watermark_limit,
+        anchor_event_index_before: result.anchor_event_index_before,
+        anchor_event_index_after: result.anchor_event_index_after,
+      });
+      const estimate = this.estimateSessionContextTokens(params.session);
+      this.emit("session.context.estimate", {
+        session_id: params.session.id,
+        provider: estimate.provider,
+        source: estimate.source,
+        total_tokens_estimate: estimate.total,
+        breakdown: estimate.breakdown,
+      });
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit("compaction.failed", {
+        session_id: params.session.id,
+        turn_id: params.turnId,
+        reason: params.reason,
+        message,
+      });
+      throw new Error(`context compaction failed: ${message}`);
+    }
+  }
+
+  private async runSummaryModelInference(params: {
+    provider: AuthProvider;
+    systemInstruction: string;
+    messages: ChatMessage[];
+  }): Promise<string> {
+    if (params.provider === "antigravity") {
+      const result = await runAntigravityInferenceStream({
+        accessToken: this.antigravityOauthTokenInfo?.accessToken ?? "",
+        model: this.selectedModel,
+        messages: params.messages,
+        thinkingLevel: "OFF",
+        includeThoughts: false,
+        toolMode: "disabled",
+        systemInstruction: params.systemInstruction,
+      });
+      return result.answer;
+    }
+
+    if (params.provider === "openrouter") {
+      const result = await runOpenRouterInferenceStream({
+        apiKey: this.openRouterApiKey,
+        model: this.selectedModel,
+        messages: params.messages,
+        thinkingLevel: "OFF",
+        includeThoughts: false,
+        toolMode: "disabled",
+        forcedProvider:
+          normalizeOpenRouterProviderSelection(this.selectedOpenRouterProvider) === OPENROUTER_PROVIDER_ANY_ID
+            ? null
+            : normalizeOpenRouterProviderSelection(this.selectedOpenRouterProvider),
+        systemInstruction: params.systemInstruction,
+      });
+      return result.answer;
+    }
+
+    const result = await runOpenAiInferenceStream({
+      accessToken: this.openAiAccessToken,
+      chatgptAccountId: this.openAiAccountId,
+      model: this.selectedModel,
+      messages: params.messages,
+      thinkingLevel: "OFF",
+      includeThoughts: false,
+      toolMode: "disabled",
+      systemInstruction: params.systemInstruction,
+    });
+    return result.answer;
+  }
+
+  private buildCompactionHistoryForModel(session: RuntimeSession, provider: AuthProvider): ChatMessage[] {
+    const cache = this.ensureCompactionCache(session, provider);
+    return buildModelContextMessages({
+      summaryState: cache.state.summary_state,
+      events: cache.events,
+      anchorEventIndex: cache.state.last_anchor_event_index,
+    });
+  }
+
+  private captureCompactionDebugEvent(params: {
+    session: RuntimeSession;
+    provider: AuthProvider;
+    turnId: string;
+    event: DebugEvent;
+    cache?: SessionCompactionCache;
+  }): void {
+    const data = isObjectRecord(params.event.data) ? params.event.data : {};
+
+    if (params.event.stage === "tool_call_started") {
+      const call = isObjectRecord(data.call) ? data.call : {};
+      const toolName = readTrimmedString(call.name);
+      const input = isObjectRecord(call.input) ? call.input : {};
+      const command = toolName === "bash" ? readTrimmedString(input.command) : "";
+      this.appendCompactionEventSafe({
+        session: params.session,
+        provider: params.provider,
+        type: "command_run",
+        turnId: params.turnId,
+        cache: params.cache,
+        payload: {
+          tool_name: toolName,
+          input,
+          command: command || undefined,
+        },
+      });
+      return;
+    }
+
+    if (params.event.stage === "tool_results") {
+      const executed = Array.isArray(data.executed) ? data.executed : [];
+      for (const raw of executed) {
+        const record = isObjectRecord(raw) ? raw : {};
+        const toolName = readTrimmedString(record.name);
+        const ok = record.ok === true;
+        const input = isObjectRecord(record.input) ? record.input : {};
+        const command = toolName === "bash" ? readTrimmedString(input.command) : "";
+        const error = readTrimmedString(record.error);
+        const outputPreview = summarizeToolResult(record.result);
+
+        this.appendCompactionEventSafe({
+          session: params.session,
+          provider: params.provider,
+          type: "tool_result",
+          turnId: params.turnId,
+          cache: params.cache,
+          payload: {
+            tool_name: toolName,
+            ok,
+            input,
+            command: command || undefined,
+            error: error || undefined,
+            output_preview: outputPreview || undefined,
+          },
+        });
+
+        if (!ok) {
+          this.appendCompactionEventSafe({
+            session: params.session,
+            provider: params.provider,
+            type: "error_observed",
+            turnId: params.turnId,
+            cache: params.cache,
+            payload: {
+              message: error || `${toolName || "tool"} execution failed`,
+              tool_name: toolName,
+              stage: "tool_result",
+            },
+          });
+        }
+      }
+    }
   }
 
   getState(): RuntimeSnapshot {
@@ -557,6 +895,7 @@ export class LoafCoreRuntime {
       queuedPrompts: [],
       steeringQueue: [],
       activeAbortController: null,
+      compaction: null,
     };
 
     this.sessions.set(id, session);
@@ -578,6 +917,7 @@ export class LoafCoreRuntime {
   }
 
   private toSessionState(session: RuntimeSession): RuntimeSessionState {
+    const contextEstimate = this.estimateSessionContextTokens(session);
     return {
       id: session.id,
       createdAt: session.createdAt,
@@ -590,6 +930,67 @@ export class LoafCoreRuntime {
       pendingSteerCount: session.steeringQueue.length,
       conversationProvider: session.conversationProvider,
       activeSessionId: session.activeSession?.id ?? null,
+      contextTokenEstimate: contextEstimate.total,
+      contextTokenSource: contextEstimate.source,
+      contextTokenProvider: contextEstimate.provider,
+      contextTokenBreakdown: contextEstimate.breakdown,
+    };
+  }
+
+  private estimateSessionContextTokens(session: RuntimeSession): {
+    total: number;
+    source: "compaction" | "history";
+    provider: AuthProvider | null;
+    breakdown: RuntimeSessionState["contextTokenBreakdown"];
+  } {
+    const provider = this.selectedModelProvider ?? session.conversationProvider;
+    const baseInstruction = buildRuntimeSystemInstruction({
+      baseInstruction: loafConfig.systemInstruction,
+      hasExaSearch: Boolean(this.exaApiKey.trim()),
+      skillInstructionBlock: "",
+    });
+    const pinnedTokens = estimatePinnedInstructionTokens(baseInstruction);
+
+    if (!provider) {
+      const conversationTokens = estimateHistoryTokens(session.history);
+      return {
+        total: Math.max(0, pinnedTokens + conversationTokens),
+        source: "history",
+        provider: null,
+        breakdown: {
+          pinned_tokens: pinnedTokens,
+          conversation_tokens: conversationTokens,
+          tool_schema_tokens: 0,
+          provider_overhead_tokens: 0,
+        },
+      };
+    }
+
+    let source: "compaction" | "history" = "history";
+    let conversationTokens = estimateHistoryTokens(session.history);
+    if (session.compaction || session.activeSession) {
+      try {
+        const historyForModel = this.buildCompactionHistoryForModel(session, provider);
+        conversationTokens = estimateHistoryTokens(historyForModel);
+        source = "compaction";
+      } catch {
+        // keep history fallback estimate
+      }
+    }
+
+    const toolSchemaTokens = estimateToolSchemaTokensForProvider(provider);
+    const providerOverheadTokens = PROVIDER_REQUEST_OVERHEAD_TOKENS[provider] ?? 0;
+    const total = pinnedTokens + conversationTokens + toolSchemaTokens + providerOverheadTokens;
+    return {
+      total: Math.max(0, total),
+      source,
+      provider,
+      breakdown: {
+        pinned_tokens: pinnedTokens,
+        conversation_tokens: conversationTokens,
+        tool_schema_tokens: toolSchemaTokens,
+        provider_overhead_tokens: providerOverheadTokens,
+      },
     };
   }
 
@@ -737,6 +1138,129 @@ export class LoafCoreRuntime {
     const cleanPrompt = input.text.trim();
     const promptWithImageRefs = appendMissingImagePlaceholders(cleanPrompt, promptImages.length);
 
+    if (isLoafEasterEggTrigger(cleanPrompt)) {
+      const userMessage: RuntimeUiMessage = {
+        id: this.nextUiMessageId(),
+        kind: "user",
+        text: promptWithImageRefs,
+        images: promptImages.length > 0 ? promptImages : undefined,
+      };
+      this.appendSessionMessage(session, userMessage);
+
+      const providerForEvents = this.selectedModelProvider ?? session.conversationProvider;
+      if (providerForEvents) {
+        this.appendCompactionEventSafe({
+          session,
+          provider: providerForEvents,
+          type: "user_msg",
+          turnId,
+          payload: {
+            text: promptWithImageRefs,
+            image_count: promptImages.length,
+            easter_egg: "loaf",
+          },
+        });
+      }
+
+      const revealResult = runLoafEasterEggRevealWithRetry();
+      const assistantText = revealResult.ok
+        ? "loaf mode unlocked. sliced."
+        : `loaf reveal failed: ${revealResult.error}`;
+
+      this.appendSessionMessage(session, {
+        id: this.nextUiMessageId(),
+        kind: "assistant",
+        text: assistantText,
+      });
+
+      session.history = [
+        ...session.history,
+        {
+          role: "user",
+          text: promptWithImageRefs,
+          images: promptImages.length > 0 ? promptImages : undefined,
+        },
+        {
+          role: "assistant",
+          text: assistantText,
+        },
+      ];
+      if (providerForEvents) {
+        session.conversationProvider = providerForEvents;
+      }
+
+      if (providerForEvents) {
+        let sessionForTurn = session.activeSession;
+        if (!sessionForTurn) {
+          try {
+            sessionForTurn = createChatSession({
+              provider: providerForEvents,
+              model: this.selectedModel || (session.activeSession?.model ?? ""),
+              thinkingLevel: this.selectedThinking,
+              openRouterProvider:
+                providerForEvents === "openrouter"
+                  ? normalizeOpenRouterProviderSelection(this.selectedOpenRouterProvider)
+                  : undefined,
+              titleHint: cleanPrompt,
+            });
+            session.activeSession = sessionForTurn;
+          } catch {
+            sessionForTurn = null;
+            session.activeSession = null;
+          }
+        }
+
+        if (sessionForTurn) {
+          try {
+            session.activeSession = writeChatSession({
+              session: sessionForTurn,
+              messages: session.history,
+              provider: providerForEvents,
+              model: this.selectedModel,
+              thinkingLevel: this.selectedThinking,
+              openRouterProvider:
+                providerForEvents === "openrouter"
+                  ? normalizeOpenRouterProviderSelection(this.selectedOpenRouterProvider)
+                  : undefined,
+              titleHint: cleanPrompt,
+            });
+            this.migrateCompactionCacheToRollout(session, session.activeSession.rolloutPath);
+          } catch {
+            // ignore easter-egg history save errors
+          }
+        }
+      }
+
+      if (providerForEvents) {
+        this.appendCompactionEventSafe({
+          session,
+          provider: providerForEvents,
+          type: "assistant_msg",
+          turnId,
+          payload: {
+            text: assistantText,
+            easter_egg: "loaf",
+          },
+        });
+      }
+
+      if (!revealResult.ok) {
+        this.emit("session.error", {
+          session_id: session.id,
+          turn_id: turnId,
+          message: assistantText,
+        });
+      } else {
+        this.emit("session.completed", {
+          session_id: session.id,
+          turn_id: turnId,
+          answer_length: assistantText.length,
+        });
+      }
+
+      return;
+    }
+
     const provider = this.selectedModelProvider;
     if (!provider) {
       const message = "select a model from an enabled provider first";
@@ -808,6 +1332,12 @@ export class LoafCoreRuntime {
     }
     await this.persistState();
 
+    const runtimeSystemInstruction = buildRuntimeSystemInstruction({
+      baseInstruction: loafConfig.systemInstruction,
+      hasExaSearch: Boolean(this.exaApiKey.trim()),
+      skillInstructionBlock: skillPromptContext.instructionBlock,
+    });
+
     const compressionBudget = getCompressionBudgetForModel({
       modelId: this.selectedModel,
       provider,
@@ -815,30 +1345,43 @@ export class LoafCoreRuntime {
     });
     const providerSwitchRequiresCompression =
       session.conversationProvider !== null && session.conversationProvider !== provider && session.history.length > 0;
-    const estimatedHistoryTokens = estimateHistoryTokens(session.history);
-    if (providerSwitchRequiresCompression) {
-      this.compressSessionHistory({
-        session,
-        reason: "provider_switch",
-        fromProvider: session.conversationProvider,
-        toProvider: provider,
-        contextWindowTokens: compressionBudget.contextWindowTokens,
-        tokenLimit: compressionBudget.autoCompressionTokenLimit,
-        estimatedBeforeTokens: estimatedHistoryTokens,
-      });
-      session.activeSession = null;
-    } else if (
-      session.history.length > 0 &&
-      estimatedHistoryTokens >= compressionBudget.autoCompressionTokenLimit
-    ) {
-      this.compressSessionHistory({
-        session,
-        reason: "auto",
-        contextWindowTokens: compressionBudget.contextWindowTokens,
-        tokenLimit: compressionBudget.autoCompressionTokenLimit,
-        estimatedBeforeTokens: estimatedHistoryTokens,
-      });
+    if (session.history.length > 0) {
+      const reason: CompactionReason = providerSwitchRequiresCompression ? "provider_switch" : "auto";
+      try {
+        const compactionResult = await this.runSessionCompaction({
+          session,
+          provider,
+          reason,
+          contextWindowTokens: compressionBudget.contextWindowTokens,
+          force: providerSwitchRequiresCompression,
+          turnId,
+          pinnedInstruction: runtimeSystemInstruction,
+        });
+        if (compactionResult.compressed) {
+          if (reason === "provider_switch") {
+            this.appendSystemMessage(
+              session,
+              `provider switched: ${session.conversationProvider ?? "unknown"} -> ${provider}. context compressed (${formatTokenCount(compactionResult.estimated_tokens_before)} -> ${formatTokenCount(compactionResult.estimated_tokens_after)} est. tokens).`,
+            );
+          } else {
+            this.appendSystemMessage(
+              session,
+              `context compression (auto): ${formatTokenCount(compactionResult.estimated_tokens_before)} -> ${formatTokenCount(compactionResult.estimated_tokens_after)} est. tokens (limit ${formatTokenCount(compactionResult.high_watermark_limit)} / window ${formatTokenCount(compactionResult.model_context_window)}).`,
+            );
+          }
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.appendSystemMessage(session, message);
+        this.emit("session.error", {
+          session_id: session.id,
+          turn_id: turnId,
+          message,
+        });
+        return;
+      }
     }
+    const compactionCacheForTurn = this.ensureCompactionCache(session, provider);
 
     session.pending = true;
     session.statusLabel = this.selectedThinking === "OFF" ? "drafting response..." : "thinking...";
@@ -870,12 +1413,13 @@ export class LoafCoreRuntime {
           openRouterProvider: normalizedOpenRouterProvider,
           titleHint: cleanPrompt || (promptImages.length > 0 ? `image: ${path.basename(promptImages[0]!.path)}` : undefined),
         });
-        session.activeSession = sessionForTurn;
+        if (!session.activeSession) {
+          session.activeSession = sessionForTurn;
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         this.appendSystemMessage(session, `history save disabled for this turn: ${message}`);
         sessionForTurn = null;
-        session.activeSession = null;
       }
     }
 
@@ -888,8 +1432,9 @@ export class LoafCoreRuntime {
       },
     ];
 
+    const contextHistoryForModel = this.buildCompactionHistoryForModel(session, provider);
     const modelHistory: ChatMessage[] = [
-      ...mapMessagesForModel(historyBase, skillCatalog.skills),
+      ...mapMessagesForModel(contextHistoryForModel, skillCatalog.skills),
       {
         role: "user",
         text: skillPromptContext.modelPrompt,
@@ -904,6 +1449,17 @@ export class LoafCoreRuntime {
       images: promptImages.length > 0 ? promptImages : undefined,
     };
     this.appendSessionMessage(session, userMessage);
+    this.appendCompactionEventSafe({
+      session,
+      provider,
+      type: "user_msg",
+      turnId,
+      cache: compactionCacheForTurn,
+      payload: {
+        text: promptWithImageRefs,
+        image_count: promptImages.length,
+      },
+    });
 
     let assistantDraftText = "";
     const appliedSteeringMessages: ChatMessage[] = [];
@@ -996,6 +1552,13 @@ export class LoafCoreRuntime {
           data: event.data as Record<string, unknown>,
         });
       }
+      this.captureCompactionDebugEvent({
+        session,
+        provider,
+        turnId,
+        event,
+        cache: compactionCacheForTurn,
+      });
     };
 
     const drainSteeringMessages = (): ChatMessage[] => {
@@ -1022,12 +1585,6 @@ export class LoafCoreRuntime {
     };
 
     try {
-      const runtimeSystemInstruction = buildRuntimeSystemInstruction({
-        baseInstruction: loafConfig.systemInstruction,
-        hasExaSearch: Boolean(this.exaApiKey.trim()),
-        skillInstructionBlock: skillPromptContext.instructionBlock,
-      });
-
       const result =
         provider === "antigravity"
           ? await runAntigravityInferenceStream(
@@ -1094,6 +1651,16 @@ export class LoafCoreRuntime {
       const savedHistory = [...nextHistory, ...appliedSteeringMessages, assistantMessage];
       session.history = savedHistory;
       session.conversationProvider = provider;
+      this.appendCompactionEventSafe({
+        session,
+        provider,
+        type: "assistant_msg",
+        turnId,
+        cache: compactionCacheForTurn,
+        payload: {
+          text: finalAssistantText,
+        },
+      });
 
       if (sessionForTurn) {
         try {
@@ -1106,6 +1673,7 @@ export class LoafCoreRuntime {
             openRouterProvider: normalizedOpenRouterProvider,
             titleHint: cleanPrompt,
           });
+          this.migrateCompactionCacheToRollout(session, session.activeSession.rolloutPath);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           this.appendSystemMessage(session, `chat history save failed: ${message}`);
@@ -1139,6 +1707,7 @@ export class LoafCoreRuntime {
               openRouterProvider: normalizedOpenRouterProvider,
               titleHint: cleanPrompt,
             });
+            this.migrateCompactionCacheToRollout(session, session.activeSession.rolloutPath);
           } catch {
             // ignore write failure on aborted turn
           }
@@ -1149,6 +1718,17 @@ export class LoafCoreRuntime {
             id: this.nextUiMessageId(),
             kind: "assistant",
             text: interruptedAssistant,
+          });
+          this.appendCompactionEventSafe({
+            session,
+            provider,
+            type: "assistant_msg",
+            turnId,
+            cache: compactionCacheForTurn,
+            payload: {
+              text: interruptedAssistant,
+              interrupted: true,
+            },
           });
         }
 
@@ -1165,6 +1745,17 @@ export class LoafCoreRuntime {
       } else {
         const message = error instanceof Error ? error.message : String(error);
         this.appendSystemMessage(session, `inference error: ${message}`);
+        this.appendCompactionEventSafe({
+          session,
+          provider,
+          type: "error_observed",
+          turnId,
+          cache: compactionCacheForTurn,
+          payload: {
+            message,
+            stage: "inference",
+          },
+        });
         this.emit("session.error", {
           session_id: session.id,
           turn_id: turnId,
@@ -1262,6 +1853,7 @@ export class LoafCoreRuntime {
       session.activeSession = null;
       session.conversationProvider = null;
       session.queuedPrompts = [];
+      session.compaction = null;
       await this.persistState();
       this.appendSystemMessage(session, "all local config was cleared. onboarding restarted.");
       this.emit("state.changed", {
@@ -1308,6 +1900,7 @@ export class LoafCoreRuntime {
       session.history = [];
       session.conversationProvider = null;
       session.activeSession = null;
+      session.compaction = null;
       return {
         handled: true,
         output: {
@@ -1316,27 +1909,46 @@ export class LoafCoreRuntime {
       };
     }
 
-    if (command === "/compression") {
-      const provider = this.selectedModelProvider;
+    if (command === "/compress") {
+      const provider = this.selectedModelProvider ?? session.conversationProvider;
+      if (!provider) {
+        throw new Error("select a model first before running /compress");
+      }
       const budget = getCompressionBudgetForModel({
         modelId: this.selectedModel,
         provider,
         modelOptionsByProvider: this.modelOptionsByProvider,
       });
-      const result = this.compressSessionHistory({
+      const runtimeSystemInstruction = buildRuntimeSystemInstruction({
+        baseInstruction: loafConfig.systemInstruction,
+        hasExaSearch: Boolean(this.exaApiKey.trim()),
+        skillInstructionBlock: "",
+      });
+      const result = await this.runSessionCompaction({
         session,
+        provider,
         reason: "manual",
         contextWindowTokens: budget.contextWindowTokens,
-        tokenLimit: budget.autoCompressionTokenLimit,
+        force: true,
+        pinnedInstruction: runtimeSystemInstruction,
       });
+      if (result.compressed) {
+        this.appendSystemMessage(
+          session,
+          `context compression complete: ${formatTokenCount(result.estimated_tokens_before)} -> ${formatTokenCount(result.estimated_tokens_after)} est. tokens.`,
+        );
+      }
       return {
         handled: true,
         output: {
-          compressed: result.applied,
-          estimated_tokens_before: result.estimatedBeforeTokens,
-          estimated_tokens_after: result.estimatedAfterTokens,
-          model_context_window: budget.contextWindowTokens,
-          auto_limit: budget.autoCompressionTokenLimit,
+          compressed: result.compressed,
+          reason: result.reason,
+          estimated_tokens_before: result.estimated_tokens_before,
+          estimated_tokens_after: result.estimated_tokens_after,
+          model_context_window: result.model_context_window,
+          target_limit: result.target_limit,
+          anchor_event_index_before: result.anchor_event_index_before,
+          anchor_event_index_after: result.anchor_event_index_after,
         },
       };
     }
@@ -1634,7 +2246,9 @@ export class LoafCoreRuntime {
           estimated_tokens_before: number;
           estimated_tokens_after: number;
           model_context_window: number;
-          auto_limit: number;
+          target_limit: number;
+          anchor_event_index_before: number;
+          anchor_event_index_after: number;
         }
       | undefined;
 
@@ -1650,51 +2264,52 @@ export class LoafCoreRuntime {
         provider: params.provider,
         modelOptionsByProvider: this.modelOptionsByProvider,
       });
-      const estimatedBeforeTokens = estimateHistoryTokens(session.history);
       const providerSwitchRequiresCompression =
         session.conversationProvider !== null &&
         session.conversationProvider !== params.provider &&
         session.history.length > 0;
-      const budgetRequiresCompression =
-        session.history.length > 0 && estimatedBeforeTokens >= budget.autoCompressionTokenLimit;
 
-      const shouldCompress = providerSwitchRequiresCompression || budgetRequiresCompression;
-      if (shouldCompress) {
+      if (session.history.length > 0) {
         const reason: "provider_switch" | "auto" = providerSwitchRequiresCompression ? "provider_switch" : "auto";
-        const result = this.compressSessionHistory({
-          session,
-          reason,
-          fromProvider: providerSwitchRequiresCompression ? session.conversationProvider : undefined,
-          toProvider: providerSwitchRequiresCompression ? params.provider : undefined,
-          contextWindowTokens: budget.contextWindowTokens,
-          tokenLimit: budget.autoCompressionTokenLimit,
-          estimatedBeforeTokens,
+        const runtimeSystemInstruction = buildRuntimeSystemInstruction({
+          baseInstruction: loafConfig.systemInstruction,
+          hasExaSearch: Boolean(this.exaApiKey.trim()),
+          skillInstructionBlock: "",
         });
-
+        const result = await this.runSessionCompaction({
+          session,
+          provider: params.provider,
+          reason,
+          contextWindowTokens: budget.contextWindowTokens,
+          force: true,
+          pinnedInstruction: runtimeSystemInstruction,
+        });
         if (providerSwitchRequiresCompression) {
-          session.activeSession = null;
-          // Keep provider bookkeeping aligned so the next prompt doesn't compress again.
+          // Keep provider bookkeeping aligned so next prompt doesn't force another switch compression.
           session.conversationProvider = params.provider;
         }
-
         compression = {
           requested: true,
-          applied: result.applied,
+          applied: result.compressed,
           reason,
-          estimated_tokens_before: result.estimatedBeforeTokens,
-          estimated_tokens_after: result.estimatedAfterTokens,
-          model_context_window: budget.contextWindowTokens,
-          auto_limit: budget.autoCompressionTokenLimit,
+          estimated_tokens_before: result.estimated_tokens_before,
+          estimated_tokens_after: result.estimated_tokens_after,
+          model_context_window: result.model_context_window,
+          target_limit: result.target_limit,
+          anchor_event_index_before: result.anchor_event_index_before,
+          anchor_event_index_after: result.anchor_event_index_after,
         };
       } else {
         compression = {
           requested: true,
           applied: false,
           reason: "none",
-          estimated_tokens_before: estimatedBeforeTokens,
-          estimated_tokens_after: estimatedBeforeTokens,
+          estimated_tokens_before: 0,
+          estimated_tokens_after: 0,
           model_context_window: budget.contextWindowTokens,
-          auto_limit: budget.autoCompressionTokenLimit,
+          target_limit: budget.autoCompressionTokenLimit,
+          anchor_event_index_before: 0,
+          anchor_event_index_after: 0,
         };
       }
     }
@@ -1795,6 +2410,7 @@ export class LoafCoreRuntime {
     session.pending = false;
     session.statusLabel = "ready";
     session.updatedAt = new Date().toISOString();
+    session.compaction = null;
     return {
       session_id: session.id,
       cleared: true,
@@ -2000,6 +2616,7 @@ export class LoafCoreRuntime {
       messageCount: chat.messageCount,
       rolloutPath: chat.rolloutPath,
     };
+    session.compaction = null;
     session.updatedAt = new Date().toISOString();
     this.emit("state.changed", {
       reason: "session_resumed",
@@ -2015,7 +2632,7 @@ const COMMAND_OPTIONS: Array<{ name: string; description: string }> = [
   { name: "/model", description: "choose model and thinking level" },
   { name: "/limits", description: "show oauth usage limits" },
   { name: "/history", description: "resume a saved chat (/history, /history last, /history <id>)" },
-  { name: "/compression", description: "compress conversation context to reduce token usage" },
+  { name: "/compress", description: "compress conversation context to reduce token usage" },
   { name: "/skills", description: "list available skills" },
   { name: "/tools", description: "list registered tools" },
   { name: "/clear", description: "clear conversation messages" },
@@ -2045,6 +2662,107 @@ function parseThoughtTitle(rawThought: string): string {
   }
   const firstLine = text.split("\n")[0]?.trim();
   return (firstLine || "reasoning").toLowerCase();
+}
+
+function isLoafEasterEggTrigger(text: string): boolean {
+  const normalized = collapseWhitespace(text)
+    .toLowerCase()
+    .replace(/[’`]/g, "'");
+  return normalized === "i am a loaf" || normalized === "im a loaf" || normalized === "i'm a loaf";
+}
+
+function runLoafEasterEggRevealWithRetry(): {
+  ok: true;
+  outputPath: string;
+} | {
+  ok: false;
+  error: string;
+} {
+  const firstAttempt = runLoafEasterEggReveal();
+  if (firstAttempt.ok) {
+    return firstAttempt;
+  }
+
+  const secondAttempt = runLoafEasterEggReveal();
+  if (secondAttempt.ok) {
+    return secondAttempt;
+  }
+
+  return {
+    ok: false,
+    error: secondAttempt.error || firstAttempt.error || "unknown error",
+  };
+}
+
+function runLoafEasterEggReveal(): {
+  ok: true;
+  outputPath: string;
+} | {
+  ok: false;
+  error: string;
+} {
+  try {
+    const outDir = path.join(os.tmpdir(), "loaf-easter-egg");
+    const outPath = path.join(outDir, "loaf.png");
+    fs.mkdirSync(outDir, { recursive: true });
+    fs.writeFileSync(outPath, Buffer.from(LOAF_EASTER_EGG_IMAGE_B64, "base64"));
+
+    const openResult = openFileInDefaultViewer(outPath);
+    if (!openResult.ok) {
+      return {
+        ok: false,
+        error: openResult.error,
+      };
+    }
+
+    return {
+      ok: true,
+      outputPath: outPath,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function openFileInDefaultViewer(filePath: string): { ok: true } | { ok: false; error: string } {
+  let result:
+    | ReturnType<typeof spawnSync>
+    | undefined;
+
+  if (process.platform === "win32") {
+    result = spawnSync("cmd", ["/c", "start", "", filePath], {
+      stdio: "ignore",
+      windowsHide: true,
+      shell: false,
+    });
+  } else if (process.platform === "darwin") {
+    result = spawnSync("open", [filePath], {
+      stdio: "ignore",
+    });
+  } else {
+    result = spawnSync("xdg-open", [filePath], {
+      stdio: "ignore",
+    });
+  }
+
+  if (result.error) {
+    return {
+      ok: false,
+      error: result.error.message,
+    };
+  }
+  if (typeof result.status === "number" && result.status !== 0) {
+    return {
+      ok: false,
+      error: `open command exited with status ${result.status}`,
+    };
+  }
+  return {
+    ok: true,
+  };
 }
 
 function appendMissingImagePlaceholders(prompt: string, imageCount: number): string {
@@ -2232,67 +2950,6 @@ function computeAutoCompressionTokenLimit(contextWindowTokens: number): number {
   return Math.min(normalizedWindow, boundedLimit);
 }
 
-function buildCompressionSummaryText(params: {
-  reason: "manual" | "auto" | "provider_switch";
-  modelId: string;
-  contextWindowTokens: number;
-  tokenLimit: number;
-  summarySource: ChatMessage[];
-}): string {
-  const entries = params.summarySource
-    .map((message) => {
-      const text = collapseWhitespace(message.text);
-      if (!text || isCompressionMetaMessage(text)) {
-        return "";
-      }
-      const roleLabel = message.role === "assistant" ? "assistant" : "user";
-      const imageCount = Array.isArray(message.images) ? message.images.length : 0;
-      const imageSuffix = imageCount > 0 ? ` [images: ${imageCount}]` : "";
-      return `${roleLabel}: ${clipInline(text, MAX_COMPRESSION_SUMMARY_LINE_CHARS)}${imageSuffix}`;
-    })
-    .filter(Boolean);
-
-  const selectedEntries = selectCompressionEntries(entries, MAX_COMPRESSION_SUMMARY_ENTRIES);
-  const modelLabel = params.modelId.trim() || "unknown-model";
-  const lines = [
-    "[conversation compression]",
-    `reason: ${params.reason.replace("_", " ")}`,
-    `model: ${modelLabel}`,
-    `window: ${formatTokenCount(params.contextWindowTokens)} tokens | auto limit: ${formatTokenCount(params.tokenLimit)} tokens`,
-    "condensed prior context:",
-  ];
-
-  if (selectedEntries.length === 0) {
-    lines.push("- no prior text content to summarize.");
-  } else {
-    for (const entry of selectedEntries) {
-      lines.push(entry === "..." ? "- ..." : `- ${entry}`);
-    }
-  }
-
-  return clipInline(lines.join("\n"), MAX_COMPRESSION_SUMMARY_TOTAL_CHARS);
-}
-
-function selectCompressionEntries(entries: string[], maxEntries: number): string[] {
-  if (entries.length <= maxEntries) {
-    return entries;
-  }
-
-  const headCount = Math.max(2, Math.floor(maxEntries / 3));
-  const tailCount = Math.max(2, maxEntries - headCount);
-  return [...entries.slice(0, headCount), "...", ...entries.slice(-tailCount)];
-}
-
-function isCompressionMetaMessage(text: string): boolean {
-  const normalized = text.toLowerCase();
-  return (
-    normalized.includes("[conversation compression]") ||
-    normalized.startsWith("context compression complete:") ||
-    normalized.startsWith("context compression (auto):") ||
-    normalized.includes("context compressed")
-  );
-}
-
 function collapseWhitespace(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
@@ -2303,6 +2960,66 @@ function clipInline(text: string, maxLength: number): string {
     return compact;
   }
   return `${compact.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function estimatePinnedInstructionTokens(instruction: string): number {
+  const compact = collapseWhitespace(instruction);
+  if (!compact) {
+    return 0;
+  }
+  return APPROX_HISTORY_MESSAGE_OVERHEAD_TOKENS + Math.ceil(compact.length / APPROX_HISTORY_TOKENS_PER_CHAR);
+}
+
+function summarizeToolResult(value: unknown): string {
+  if (typeof value === "string") {
+    return clipInline(collapseWhitespace(value), 220);
+  }
+  if (!isObjectRecord(value)) {
+    return "";
+  }
+  const stdout = readTrimmedString(value.stdout);
+  const stderr = readTrimmedString(value.stderr);
+  const message = readTrimmedString(value.message);
+  const direct = stdout || stderr || message;
+  if (direct) {
+    return clipInline(collapseWhitespace(direct), 220);
+  }
+  try {
+    return clipInline(JSON.stringify(value), 220);
+  } catch {
+    return "";
+  }
+}
+
+function estimateToolSchemaTokensForProvider(provider: AuthProvider): number {
+  const tools = defaultToolRegistry.list();
+  if (tools.length === 0) {
+    return 0;
+  }
+
+  let schemaChars = 0;
+  for (const tool of tools) {
+    schemaChars += tool.name.trim().length;
+    schemaChars += tool.description.trim().length;
+    try {
+      schemaChars += JSON.stringify(tool.inputSchema).length;
+    } catch {
+      // ignore tool schema stringify failures for estimate
+    }
+  }
+
+  const schemaTokens = Math.ceil(schemaChars / APPROX_HISTORY_TOKENS_PER_CHAR);
+  const perToolOverhead = TOOL_SCHEMA_PER_TOOL_OVERHEAD_TOKENS[provider] ?? 16;
+  const envelopeOverhead = provider === "antigravity" ? 24 : 16;
+  return Math.max(0, schemaTokens + tools.length * perToolOverhead + envelopeOverhead);
+}
+
+function readTrimmedString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function formatTokenCount(value: number): string {

@@ -11,6 +11,7 @@ export type OpenAIRequest = {
   messages: ChatMessage[];
   thinkingLevel: ThinkingLevel;
   includeThoughts: boolean;
+  toolMode?: "enabled" | "disabled";
   systemInstruction?: string;
   sessionId?: string;
   signal?: AbortSignal;
@@ -211,16 +212,25 @@ export async function runOpenAiInferenceStream(
     const fullInput = [...conversationInput, ...roundInput];
 
     toolRound += 1;
-    const toolDeclarations = buildToolDeclarations();
+    const toolMode = request.toolMode ?? "enabled";
+    const toolsEnabled = toolMode !== "disabled";
+    const toolDeclarations = toolsEnabled
+      ? buildToolDeclarations()
+      : {
+          declarations: [],
+          providerToRuntimeName: new Map<string, string>(),
+        };
     const requestPayload: Record<string, unknown> = {
       model: request.model,
       instructions: systemInstruction,
-      tools: toolDeclarations.declarations,
-      tool_choice: "auto",
-      parallel_tool_calls: false,
       store: false,
       stream: true,
     };
+    if (toolsEnabled) {
+      requestPayload.tools = toolDeclarations.declarations;
+      requestPayload.tool_choice = "auto";
+      requestPayload.parallel_tool_calls = false;
+    }
 
     requestPayload.reasoning = {
       effort: mapThinkingToOpenAiEffort(request.thinkingLevel),

@@ -256,7 +256,7 @@ const COMMAND_OPTIONS: CommandOption[] = [
   { name: "/model", description: "choose model and thinking level" },
   { name: "/limits", description: "show oauth usage limits" },
   { name: "/history", description: "resume a saved chat (/history, /history last, /history <id>)" },
-  { name: "/compression", description: "compress conversation context to reduce token usage" },
+  { name: "/compress", description: "compress conversation context to reduce token usage" },
   { name: "/skills", description: "list available skills from repo .agents/skills, ~/.loaf/skills, and ~/.agents/skills" },
   { name: "/tools", description: "list registered tools" },
   { name: "/clear", description: "clear conversation messages" },
@@ -279,7 +279,7 @@ const DEFAULT_TERMINAL_ROWS = 24;
 const DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS_UI = 272_000;
 const MIN_MODEL_CONTEXT_WINDOW_TOKENS_UI = 8_000;
 const MAX_MODEL_CONTEXT_WINDOW_TOKENS_UI = 2_000_000;
-const AUTO_COMPRESSION_CONTEXT_PERCENT_UI = 95;
+const AUTO_COMPRESSION_CONTEXT_PERCENT_UI = 82;
 const MIN_AUTO_COMPRESSION_TOKEN_LIMIT_UI = 6_000;
 const APPROX_HISTORY_TOKENS_PER_CHAR_UI = 4;
 const APPROX_HISTORY_MESSAGE_OVERHEAD_TOKENS_UI = 20;
@@ -384,6 +384,15 @@ function App() {
   const [availableSkills, setAvailableSkills] = useState<SkillDefinition[]>(initialSkillCatalog.skills);
   const [pendingImages, setPendingImages] = useState<ChatImageAttachment[]>([]);
   const [history, setHistory] = useState<ChatMessage[]>([]);
+  const [contextTokenEstimate, setContextTokenEstimate] = useState(0);
+  const [contextTokenSource, setContextTokenSource] = useState<"compaction" | "history">("history");
+  const [contextTokenBreakdown, setContextTokenBreakdown] =
+    useState<RuntimeSessionState["contextTokenBreakdown"]>({
+      pinned_tokens: 0,
+      conversation_tokens: 0,
+      tool_schema_tokens: 0,
+      provider_overhead_tokens: 0,
+    });
   const [activeSession, setActiveSession] = useState<ChatSessionSummary | null>(null);
   const [inputHistory, setInputHistory] = useState<string[]>(initialInputHistory);
   const [inputHistoryIndex, setInputHistoryIndex] = useState<number | null>(null);
@@ -498,6 +507,9 @@ function App() {
     pendingToolCallMessageIdsRef.current = [];
     setHistory(state.history);
     setConversationProvider(state.conversationProvider);
+    setContextTokenEstimate(state.contextTokenEstimate);
+    setContextTokenSource(state.contextTokenSource);
+    setContextTokenBreakdown(state.contextTokenBreakdown);
   };
 
   const refreshRuntimeState = async () => {
@@ -544,18 +556,31 @@ function App() {
     () => estimateHistoryTokensForUi(history),
     [history],
   );
+  const draftInputTokens = useMemo(
+    () => estimateDraftPromptTokensForUi(input, pendingImages, selectedModelProvider),
+    [input, pendingImages, selectedModelProvider],
+  );
+  const estimatedContextTokens = useMemo(() => {
+    const staticOverhead =
+      contextTokenBreakdown.pinned_tokens +
+      contextTokenBreakdown.tool_schema_tokens +
+      contextTokenBreakdown.provider_overhead_tokens;
+    const fallback = estimatedHistoryTokens + staticOverhead;
+    const runtimeEstimate = contextTokenEstimate > 0 ? contextTokenEstimate : fallback;
+    return Math.max(runtimeEstimate, fallback) + draftInputTokens;
+  }, [contextTokenBreakdown, contextTokenEstimate, draftInputTokens, estimatedHistoryTokens]);
   const tokenBudgetLabel = useMemo(() => {
     if (!compressionBudget) {
       return "n/a";
     }
-    return `${formatTokenCountForUi(estimatedHistoryTokens)}/${formatTokenCountForUi(compressionBudget.autoCompressionTokenLimit)} tokens`;
-  }, [compressionBudget, estimatedHistoryTokens]);
+    return `${formatTokenCountForUi(estimatedContextTokens)}/${formatTokenCountForUi(compressionBudget.autoCompressionTokenLimit)} tokens`;
+  }, [compressionBudget, estimatedContextTokens]);
   const tokenBudgetPercent = useMemo(() => {
     if (!compressionBudget || compressionBudget.autoCompressionTokenLimit <= 0) {
       return 0;
     }
-    return Math.min(999, Math.max(0, Math.round((estimatedHistoryTokens / compressionBudget.autoCompressionTokenLimit) * 100)));
-  }, [compressionBudget, estimatedHistoryTokens]);
+    return Math.min(999, Math.max(0, Math.round((estimatedContextTokens / compressionBudget.autoCompressionTokenLimit) * 100)));
+  }, [compressionBudget, estimatedContextTokens]);
   const tokenBudgetColor = tokenBudgetPercent >= 100 ? "redBright" : tokenBudgetPercent >= 85 ? "yellow" : "gray";
   const authSummary = useMemo(() => {
     const connected = dedupeAuthProviders([
@@ -771,6 +796,31 @@ function App() {
       const payload = event.payload ?? {};
       const payloadSessionId = typeof payload.session_id === "string" ? payload.session_id : "";
       if (payloadSessionId && payloadSessionId !== rpcSessionIdRef.current) {
+        return;
+      }
+
+      if (event.type === "session.context.estimate") {
+        const total =
+          typeof payload.total_tokens_estimate === "number" && Number.isFinite(payload.total_tokens_estimate)
+            ? Math.max(0, Math.floor(payload.total_tokens_estimate))
+            : 0;
+        const source =
+          payload.source === "compaction" || payload.source === "history"
+            ? payload.source
+            : "history";
+        const breakdownRaw =
+          typeof payload.breakdown === "object" && payload.breakdown !== null
+            ? (payload.breakdown as Record<string, unknown>)
+            : {};
+        const breakdown: RuntimeSessionState["contextTokenBreakdown"] = {
+          pinned_tokens: toNonNegativeInt(breakdownRaw.pinned_tokens),
+          conversation_tokens: toNonNegativeInt(breakdownRaw.conversation_tokens),
+          tool_schema_tokens: toNonNegativeInt(breakdownRaw.tool_schema_tokens),
+          provider_overhead_tokens: toNonNegativeInt(breakdownRaw.provider_overhead_tokens),
+        };
+        setContextTokenEstimate(total);
+        setContextTokenSource(source);
+        setContextTokenBreakdown(breakdown);
         return;
       }
 
@@ -1599,7 +1649,7 @@ function App() {
     const lowerContextWindowNeedsCompression =
       lowerContextWindowTarget &&
       targetBudget !== null &&
-      estimatedHistoryTokens >= targetBudget.autoCompressionTokenLimit;
+      estimatedContextTokens >= targetBudget.autoCompressionTokenLimit;
     const requiresSwitchWarning =
       hasContextToLose &&
       (providerChanged || lowerContextWindowNeedsCompression);
@@ -1657,7 +1707,9 @@ function App() {
           estimated_tokens_before: number;
           estimated_tokens_after: number;
           model_context_window: number;
-          auto_limit: number;
+          target_limit: number;
+          anchor_event_index_before: number;
+          anchor_event_index_after: number;
         };
       }>("model.select", {
         model_id: params.modelId,
@@ -1864,7 +1916,7 @@ function App() {
       return;
     }
 
-    if (command === "/compression") {
+    if (command === "/compress") {
       try {
         const result = await callRpc<{
           handled: boolean;
@@ -1873,7 +1925,7 @@ function App() {
           };
         }>("command.execute", {
           session_id: getRpcSessionId(),
-          raw_command: "/compression",
+          raw_command: "/compress",
         });
         await refreshRuntimeSessionState();
         if (result.output?.compressed === false) {
@@ -2693,7 +2745,9 @@ function App() {
       </Text>
       <Text color={tokenBudgetColor}>
         context: {tokenBudgetLabel}
-        {compressionBudget ? ` (${tokenBudgetPercent}% of auto-compression limit)` : ""}
+        {compressionBudget
+          ? ` (${tokenBudgetPercent}% of auto-compression limit${draftInputTokens > 0 ? `, +${formatTokenCountForUi(draftInputTokens)} draft` : ""}, ${contextTokenSource})`
+          : ""}
       </Text>
       <Newline />
       <Box flexDirection="column">
@@ -3046,6 +3100,32 @@ function estimateHistoryTokensForUi(history: ChatMessage[]): number {
   return Math.max(0, total);
 }
 
+function estimateDraftPromptTokensForUi(
+  input: string,
+  pendingImages: ChatImageAttachment[],
+  selectedProvider: AuthProvider | null,
+): number {
+  const trimmed = input.trim();
+  if (!trimmed || trimmed.startsWith("/")) {
+    return 0;
+  }
+
+  const textTokens = Math.ceil(trimmed.replace(/\s+/g, " ").length / APPROX_HISTORY_TOKENS_PER_CHAR_UI);
+  const imageCount = Array.isArray(pendingImages) ? pendingImages.length : 0;
+  const providerOverhead =
+    selectedProvider === "antigravity"
+      ? 10
+      : selectedProvider === "openrouter"
+        ? 8
+        : selectedProvider === "openai"
+          ? 8
+          : 6;
+  return Math.max(
+    0,
+    APPROX_HISTORY_MESSAGE_OVERHEAD_TOKENS_UI + providerOverhead + textTokens + imageCount * APPROX_HISTORY_IMAGE_TOKENS_UI,
+  );
+}
+
 function getCompressionBudgetForUi(params: {
   modelId: string;
   provider: AuthProvider | null;
@@ -3157,6 +3237,13 @@ function inferContextWindowTokensFromTextForUi(text: string): number | null {
 function formatTokenCountForUi(value: number): string {
   const normalized = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
   return normalized.toLocaleString("en-US");
+}
+
+function toNonNegativeInt(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.floor(value));
 }
 
 function shouldAutocompleteSkillInputOnEnter(rawInput: string, selectedSkillNameLower: string): boolean {

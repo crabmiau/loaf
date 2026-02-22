@@ -67,6 +67,7 @@ export type AntigravityInferenceRequest = {
   messages: ChatMessage[];
   thinkingLevel: ThinkingLevel;
   includeThoughts: boolean;
+  toolMode?: "enabled" | "disabled";
   systemInstruction?: string;
   signal?: AbortSignal;
   drainSteeringMessages?: () => ChatMessage[];
@@ -121,7 +122,14 @@ export async function runAntigravityInferenceStream(
     }
 
     toolRound += 1;
-    const toolDeclarations = buildToolDeclarations();
+    const toolMode = request.toolMode ?? "enabled";
+    const toolsEnabled = toolMode !== "disabled";
+    const toolDeclarations = toolsEnabled
+      ? buildToolDeclarations()
+      : {
+          declarations: [],
+          providerToRuntimeName: new Map<string, string>(),
+        };
     const payload = buildInferenceRequestBody({
       model: request.model,
       project,

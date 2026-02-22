@@ -9,6 +9,7 @@ export type OpenRouterRequest = {
   messages: ChatMessage[];
   thinkingLevel: ThinkingLevel;
   includeThoughts: boolean;
+  toolMode?: "enabled" | "disabled";
   forcedProvider: string | null;
   systemInstruction?: string;
   signal?: AbortSignal;
@@ -161,16 +162,25 @@ export async function runOpenRouterInferenceStream(
     }
 
     toolRound += 1;
-    const toolDeclarations = buildToolDeclarations();
+    const toolMode = request.toolMode ?? "enabled";
+    const toolsEnabled = toolMode !== "disabled";
+    const toolDeclarations = toolsEnabled
+      ? buildToolDeclarations()
+      : {
+          declarations: [],
+          providerToRuntimeName: new Map<string, string>(),
+        };
 
     const requestPayload: Record<string, unknown> = {
       model: request.model,
       messages: conversation,
-      tools: toolDeclarations.declarations,
-      tool_choice: "auto",
-      parallel_tool_calls: false,
       stream: false,
     };
+    if (toolsEnabled) {
+      requestPayload.tools = toolDeclarations.declarations;
+      requestPayload.tool_choice = "auto";
+      requestPayload.parallel_tool_calls = false;
+    }
 
     const reasoning = buildOpenRouterReasoning(request.thinkingLevel, request.includeThoughts);
     if (reasoning) {
