@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Agentic coding CLI prototype with Ink",
   "scripts": {
-    "dev": "tsx src/index.tsx",
+    "dev": "tsx src/cli.ts",
+    "rpc": "tsx src/cli.ts rpc",
     "spinners": "tsx src/spinner-gallery.tsx",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

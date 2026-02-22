@@ -78,6 +78,7 @@ export async function loadPersistedAntigravityOauthTokenInfo(): Promise<Antigrav
 export async function runAntigravityOauthLogin(options?: {
   openBrowser?: boolean;
   timeoutMs?: number;
+  onAuthUrl?: (url: string) => void;
 }): Promise<AntigravityOauthLoginResult> {
   const { server, port } = await listenOnPort(0);
   const redirectUri = `http://localhost:${port}${DEFAULT_CALLBACK_PATH}`;
@@ -92,6 +93,7 @@ export async function runAntigravityOauthLogin(options?: {
     state,
     prompt: "consent",
   });
+  options?.onAuthUrl?.(authUrl);
 
   if (options?.openBrowser !== false) {
     openExternalUrl(authUrl);
