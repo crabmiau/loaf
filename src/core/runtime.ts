@@ -939,6 +939,67 @@ export class LoafCoreRuntime {
     };
   }
 
+  private startSessionTurn(input: {
+    session: RuntimeSession;
+    turnId: string;
+    text: string;
+    imagesInput: RuntimeImageInput[];
+  }): void {
+    const { session, turnId } = input;
+    session.pending = true;
+    session.statusLabel = "preparing...";
+    session.steeringQueue = [];
+    session.activeAbortController = new AbortController();
+    session.updatedAt = new Date().toISOString();
+    this.emit("session.status", {
+      session_id: session.id,
+      pending: true,
+      status_label: session.statusLabel,
+      turn_id: turnId,
+    });
+
+    void this.runSessionTurn(input).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      this.appendSystemMessage(session, `inference error: ${message}`);
+      this.emit("session.error", {
+        session_id: session.id,
+        turn_id: turnId,
+        message,
+      });
+      this.finishSessionTurn(session);
+    });
+  }
+
+  private finishSessionTurn(session: RuntimeSession): void {
+    const unappliedSteerCount = session.steeringQueue.length;
+    session.steeringQueue = [];
+    session.activeAbortController = null;
+    session.pending = false;
+    session.statusLabel = "ready";
+    session.updatedAt = new Date().toISOString();
+    this.emit("session.status", {
+      session_id: session.id,
+      pending: false,
+      status_label: "ready",
+    });
+
+    if (unappliedSteerCount > 0) {
+      this.appendSystemMessage(session, `${unappliedSteerCount} steer message(s) were queued too late and not applied.`);
+    }
+
+    if (session.queuedPrompts.length > 0 && !this.shuttingDown) {
+      const queued = session.queuedPrompts.shift();
+      if (queued) {
+        this.startSessionTurn({
+          session,
+          turnId: queued.id,
+          text: queued.text,
+          imagesInput: queued.images,
+        });
+      }
+    }
+  }
+
   private estimateSessionContextTokens(session: RuntimeSession): {
     total: number;
     source: "compaction" | "history";
@@ -1103,7 +1164,7 @@ export class LoafCoreRuntime {
       };
     }
 
-    void this.runSessionTurn({
+    this.startSessionTurn({
       session,
       turnId,
       text,
@@ -1134,6 +1195,7 @@ export class LoafCoreRuntime {
         turn_id: turnId,
         message: loadedImagesResult.error,
       });
+      this.finishSessionTurn(session);
       return;
     }
 
@@ -1261,6 +1323,7 @@ export class LoafCoreRuntime {
         });
       }
 
+      this.finishSessionTurn(session);
       return;
     }
 
@@ -1273,6 +1336,7 @@ export class LoafCoreRuntime {
         turn_id: turnId,
         message,
       });
+      this.finishSessionTurn(session);
       return;
     }
 
@@ -1285,6 +1349,7 @@ export class LoafCoreRuntime {
         turn_id: turnId,
         message,
       });
+      this.finishSessionTurn(session);
       return;
     }
 
@@ -1296,6 +1361,7 @@ export class LoafCoreRuntime {
         turn_id: turnId,
         message,
       });
+      this.finishSessionTurn(session);
       return;
     }
 
@@ -1307,6 +1373,7 @@ export class LoafCoreRuntime {
         turn_id: turnId,
         message,
       });
+      this.finishSessionTurn(session);
       return;
     }
 
@@ -1318,6 +1385,7 @@ export class LoafCoreRuntime {
         turn_id: turnId,
         message,
       });
+      this.finishSessionTurn(session);
       return;
     }
 
@@ -1382,15 +1450,13 @@ export class LoafCoreRuntime {
           turn_id: turnId,
           message,
         });
+        this.finishSessionTurn(session);
         return;
       }
     }
     const compactionCacheForTurn = this.ensureCompactionCache(session, provider);
 
-    session.pending = true;
     session.statusLabel = this.selectedThinking === "OFF" ? "drafting response..." : "thinking...";
-    session.steeringQueue = [];
-    session.activeAbortController = new AbortController();
     this.emit("session.status", {
       session_id: session.id,
       pending: true,
@@ -1518,6 +1584,23 @@ export class LoafCoreRuntime {
     };
 
     const handleDebug = (event: DebugEvent) => {
+      if (event.stage === "retry_capacity_503") {
+        const data = (event.data ?? {}) as Record<string, unknown>;
+        const attempt =
+          typeof data.attempt === "number" && Number.isFinite(data.attempt)
+            ? Math.max(1, Math.floor(data.attempt))
+            : 1;
+        const maxAttempts =
+          typeof data.maxAttempts === "number" && Number.isFinite(data.maxAttempts)
+            ? Math.max(attempt, Math.floor(data.maxAttempts))
+            : attempt;
+        session.statusLabel = `capacity unavailable; retrying (${attempt}/${maxAttempts})...`;
+        this.emit("session.status", {
+          session_id: session.id,
+          pending: true,
+          status_label: session.statusLabel,
+        });
+      }
       if (event.stage === "tool_call_started") {
         this.emit("session.tool.call.started", {
           session_id: session.id,
@@ -1579,6 +1662,11 @@ export class LoafCoreRuntime {
       return queued;
     };
 
+    const activeAbortController = session.activeAbortController ?? new AbortController();
+    if (!session.activeAbortController) {
+      session.activeAbortController = activeAbortController;
+    }
+
     try {
       const result =
         provider === "antigravity"
@@ -1590,7 +1678,7 @@ export class LoafCoreRuntime {
                 thinkingLevel: this.selectedThinking,
                 includeThoughts: this.selectedThinking !== "OFF",
                 systemInstruction: runtimeSystemInstruction,
-                signal: session.activeAbortController.signal,
+                signal: activeAbortController.signal,
                 drainSteeringMessages,
               },
               handleChunk,
@@ -1609,7 +1697,7 @@ export class LoafCoreRuntime {
                       ? null
                       : normalizeOpenRouterProviderSelection(this.selectedOpenRouterProvider),
                   systemInstruction: runtimeSystemInstruction,
-                  signal: session.activeAbortController.signal,
+                  signal: activeAbortController.signal,
                   drainSteeringMessages,
                 },
                 handleChunk,
@@ -1624,7 +1712,7 @@ export class LoafCoreRuntime {
                   thinkingLevel: this.selectedThinking,
                   includeThoughts: this.selectedThinking !== "OFF",
                   systemInstruction: runtimeSystemInstruction,
-                  signal: session.activeAbortController.signal,
+                  signal: activeAbortController.signal,
                   drainSteeringMessages,
                 },
                 handleChunk,
@@ -1703,8 +1791,9 @@ export class LoafCoreRuntime {
               titleHint: cleanPrompt,
             });
             this.migrateCompactionCacheToRollout(session, session.activeSession.rolloutPath);
-          } catch {
-            // ignore write failure on aborted turn
+          } catch (persistError) {
+            const message = persistError instanceof Error ? persistError.message : String(persistError);
+            this.appendSystemMessage(session, `chat history save failed after interruption: ${message}`);
           }
         }
 
@@ -1758,33 +1847,7 @@ export class LoafCoreRuntime {
         });
       }
     } finally {
-      const unappliedSteerCount = session.steeringQueue.length;
-      session.steeringQueue = [];
-      session.activeAbortController = null;
-      session.pending = false;
-      session.statusLabel = "ready";
-      session.updatedAt = new Date().toISOString();
-      this.emit("session.status", {
-        session_id: session.id,
-        pending: false,
-        status_label: "ready",
-      });
-
-      if (unappliedSteerCount > 0) {
-        this.appendSystemMessage(session, `${unappliedSteerCount} steer message(s) were queued too late and not applied.`);
-      }
-
-      if (session.queuedPrompts.length > 0 && !this.shuttingDown) {
-        const queued = session.queuedPrompts.shift();
-        if (queued) {
-          void this.runSessionTurn({
-            session,
-            turnId: queued.id,
-            text: queued.text,
-            imagesInput: queued.images,
-          });
-        }
-      }
+      this.finishSessionTurn(session);
     }
   }
 
