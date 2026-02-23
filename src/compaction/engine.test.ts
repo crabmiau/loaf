@@ -110,4 +110,52 @@ describe("runAnchoredCompaction", () => {
     });
     expect(contextMessages.length).toBeGreaterThan(0);
   });
+
+  it("forces anchor advancement even when already under target budget", async () => {
+    const events = makeEvents(40);
+    const result = await runAnchoredCompaction({
+      reason: "manual",
+      events,
+      lastAnchorEventIndex: 0,
+      summaryState: createEmptySummaryState("2025-01-01T00:00:00.000Z"),
+      modelContextWindowTokens: 100_000,
+      pinnedTokenEstimate: 24,
+      estimateHistoryTokens: estimateMessages,
+      summarizeDelta: summarizerFor("manual"),
+      force: true,
+    });
+
+    expect(result.compressed).toBe(true);
+    expect(result.anchor_event_index_after).toBeGreaterThan(result.anchor_event_index_before);
+    expect(result.delta_event_count).toBeGreaterThan(0);
+  });
+
+  it("runs summarizer on forced compaction even when anchor cannot advance", async () => {
+    const events = makeEvents(4);
+    let summarizeCalls = 0;
+    const result = await runAnchoredCompaction({
+      reason: "manual",
+      events,
+      lastAnchorEventIndex: 0,
+      summaryState: createEmptySummaryState("2025-01-01T00:00:00.000Z"),
+      modelContextWindowTokens: 100_000,
+      pinnedTokenEstimate: 24,
+      estimateHistoryTokens: estimateMessages,
+      summarizeDelta: async ({ oldSummaryState, deltaEvents }) => {
+        summarizeCalls += 1;
+        return {
+          ...oldSummaryState,
+          progress: [...oldSummaryState.progress, `forced refresh with ${deltaEvents.length} delta events`],
+          updated_at_iso: new Date().toISOString(),
+        };
+      },
+      force: true,
+    });
+
+    expect(summarizeCalls).toBe(1);
+    expect(result.compressed).toBe(true);
+    expect(result.anchor_event_index_after).toBe(result.anchor_event_index_before);
+    expect(result.delta_event_count).toBe(0);
+    expect(result.summary_state.progress.at(-1)).toContain("forced refresh");
+  });
 });

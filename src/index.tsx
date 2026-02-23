@@ -306,6 +306,7 @@ const IMAGE_MIME_BY_EXT: Record<string, string> = {
 const GLYPH_USER = "> ";
 const GLYPH_ASSISTANT = "\u27E3 ";
 const GLYPH_SYSTEM = "\u2301 ";
+const PENDING_SPINNER_FRAMES = ["|", "/", "-", "\\"];
 const SEARCH_WEB_PROMPT_EXTENSION = [
   "for facts that may be stale/uncertain (dates, releases, pricing, availability, docs), proactively use search_web.",
   "prefer at least one search_web pass before answering factual questions from memory.",
@@ -360,6 +361,7 @@ function App() {
   const [autocompletedSkillPrefix, setAutocompletedSkillPrefix] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const [statusLabel, setStatusLabel] = useState("ready");
+  const [spinnerFrameIndex, setSpinnerFrameIndex] = useState(0);
   const [startupStatusLabel, setStartupStatusLabel] = useState("initializing...");
   const [superDebug, setSuperDebug] = useState(false);
   const [secretsHydrated, setSecretsHydrated] = useState(false);
@@ -445,6 +447,19 @@ function App() {
     nextIdRef.current -= 1;
     return id;
   };
+
+  useEffect(() => {
+    if (!pending) {
+      setSpinnerFrameIndex(0);
+      return;
+    }
+    const timer = setInterval(() => {
+      setSpinnerFrameIndex((current) => (current + 1) % PENDING_SPINNER_FRAMES.length);
+    }, 90);
+    return () => {
+      clearInterval(timer);
+    };
+  }, [pending]);
 
   const requireRpcClient = (): InProcessRpcClient => {
     const client = rpcClientRef.current;
@@ -2081,6 +2096,11 @@ function App() {
     }
 
     if (command === "/compress") {
+      const wasPending = pending;
+      if (!wasPending) {
+        setPending(true);
+        setStatusLabel("compressing context...");
+      }
       try {
         const result = await callRpc<{
           handled: boolean;
@@ -2092,12 +2112,17 @@ function App() {
           raw_command: "/compress",
         });
         await refreshRuntimeSessionState();
-        if (result.output?.compressed === false) {
-          appendSystemMessage("nothing to compress yet.");
+        if (result.output?.compressed === true) {
+          appendSystemMessage("compression pass completed.");
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         appendSystemMessage(`compression failed: ${message}`);
+      } finally {
+        if (!wasPending) {
+          setPending(false);
+          setStatusLabel("ready");
+        }
       }
       return;
     }
@@ -2377,6 +2402,11 @@ function App() {
         return;
       }
       if (trimmed.startsWith("/")) {
+        if (pendingCommand === "/compress") {
+          void runSlashCommand(trimmed);
+          suppressNextSubmitRef.current = true;
+          return;
+        }
         appendSystemMessage(
           "slash commands cannot be queued while running. use esc to interrupt first.",
         );
@@ -2964,7 +2994,12 @@ function App() {
         </Box>
       )}
       <Newline />
-      {pending && <Text color="yellow">{GLYPH_SYSTEM}{statusLabel}</Text>}
+      {pending && (
+        <Text color="yellow">
+          {GLYPH_SYSTEM}
+          {PENDING_SPINNER_FRAMES[spinnerFrameIndex] ?? "|"} {statusLabel}
+        </Text>
+      )}
       {showCommandSuggestionPanel && (
         <Box flexDirection="column" marginTop={1}>
           {commandSuggestionWindow.options.map((suggestion, windowIndex) => {
@@ -3105,6 +3140,10 @@ function App() {
                 return;
               }
               if (trimmed.startsWith("/")) {
+                if (pendingCommand === "/compress") {
+                  runSlashCommand(trimmed);
+                  return;
+                }
                 appendSystemMessage(
                   "slash commands cannot be queued while running. use esc to interrupt first.",
                 );

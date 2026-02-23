@@ -63,8 +63,6 @@ import {
   createCompactEvent,
 } from "../compaction/events.js";
 import {
-  buildModelContextMessages,
-  runAnchoredCompaction,
   type AnchoredCompactionResult,
   type CompactionReason,
 } from "../compaction/engine.js";
@@ -77,16 +75,13 @@ import {
   saveCompactionState,
   saveCompactionSummaryMirror,
 } from "../compaction/storage.js";
-import {
-  summarizeDeltaWithModel,
-  type StructuredSummaryModelCall,
-} from "../compaction/summarizer.js";
 import type {
   CompactEvent,
   CompactionPersistedState,
   CompactionSidecarPaths,
   SummaryState,
 } from "../compaction/types.js";
+import { createEmptySummaryState } from "../compaction/types.js";
 import { LOAF_EASTER_EGG_IMAGE_B64 } from "./loaf-easter-egg-image.js";
 
 export type RuntimeUiMessage = {
@@ -176,6 +171,13 @@ type RuntimeSession = {
   steeringQueue: ChatMessage[];
   activeAbortController: AbortController | null;
   compaction: SessionCompactionCache | null;
+  activeTurnId: string | null;
+  activeTurnPrompt: string;
+  activeTurnAssistantDraft: string;
+  activeTurnDonePromise: Promise<void> | null;
+  activeTurnDoneResolve: (() => void) | null;
+  pendingCompactionAfterInterrupt: boolean;
+  interruptedCompactionContext: InProgressCompactionContext | null;
 };
 
 type SessionCompactionCache = {
@@ -233,6 +235,62 @@ const PROVIDER_REQUEST_OVERHEAD_TOKENS: Record<AuthProvider, number> = {
   openrouter: 48,
   antigravity: 58,
 };
+const SIMPLE_COMPACTION_SYSTEM_PROMPT = [
+  "You are a helpful AI assistant tasked with summarizing conversations.",
+  "",
+  "When asked to summarize, provide a detailed but concise summary of the conversation.",
+  "Focus on information that would be helpful for continuing the conversation, including:",
+  "- What was done",
+  "- What is currently being worked on",
+  "- Which files are being modified",
+  "- What needs to be done next",
+  "- Key user requests, constraints, or preferences that should persist",
+  "- Important technical decisions and why they were made",
+  "",
+  "Your summary should be comprehensive enough to provide context but concise enough to be quickly understood.",
+  "",
+  "Do not respond to any questions in the conversation, only output the summary.",
+].join("\n");
+const SIMPLE_COMPACTION_PROMPT = [
+  "Provide a detailed prompt for continuing our conversation above.",
+  "Focus on information that would be helpful for continuing the conversation, including what we did, what we're doing, which files we're working on, and what we're going to do next.",
+  "The summary that you construct will be used so that another agent can read it and continue the work.",
+  "",
+  "When constructing the summary, try to stick to this template:",
+  "---",
+  "## Goal",
+  "",
+  "[What goal(s) is the user trying to accomplish?]",
+  "",
+  "## Instructions",
+  "",
+  "- [What important instructions did the user give you that are relevant]",
+  "- [If there is a plan or spec, include information about it so next agent can continue using it]",
+  "",
+  "## Discoveries",
+  "",
+  "[What notable things were learned during this conversation that would be useful for the next agent to know when continuing the work]",
+  "",
+  "## Accomplished",
+  "",
+  "[What work has been completed, what work is still in progress, and what work is left?]",
+  "",
+  "## Relevant files / directories",
+  "",
+  "[Construct a structured list of relevant files that have been read, edited, or created that pertain to the task at hand. If all the files in a directory are relevant, include the path to the directory.]",
+  "---",
+].join("\n");
+
+type InProgressCompactionContext = {
+  turnId: string;
+  userPrompt: string;
+  assistantDraft: string;
+  interruptedAtIso: string;
+  overflowError?: string;
+};
+
+const AUTO_CONTINUE_AFTER_COMPACTION_PROMPT =
+  "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.";
 
 export class LoafCoreRuntime {
   private readonly rpcMode: boolean;
@@ -623,42 +681,107 @@ export class LoafCoreRuntime {
     force: boolean;
     turnId?: string;
     pinnedInstruction: string;
+    inProgressContext?: InProgressCompactionContext;
   }): Promise<AnchoredCompactionResult> {
     const cache = this.ensureCompactionCache(params.session, params.provider);
-    const anchorBefore = cache.state.last_anchor_event_index;
+    const historyBefore = params.session.history;
+    const estimatedBefore = estimatePinnedInstructionTokens(params.pinnedInstruction) + estimateHistoryTokens(historyBefore);
+    const highWatermarkLimit = Math.max(
+      MIN_AUTO_COMPRESSION_TOKEN_LIMIT,
+      Math.floor((params.contextWindowTokens * AUTO_COMPRESSION_CONTEXT_PERCENT) / 100),
+    );
+    const targetLimit = Math.max(
+      MIN_AUTO_COMPRESSION_TOKEN_LIMIT,
+      Math.floor((params.contextWindowTokens * (AUTO_COMPRESSION_CONTEXT_PERCENT - 8)) / 100),
+    );
+    const mustRun = params.force || params.reason === "provider_switch" || params.reason === "manual";
+
+    if (!mustRun && estimatedBefore <= highWatermarkLimit) {
+      return {
+        compressed: false,
+        reason: params.reason,
+        estimated_tokens_before: estimatedBefore,
+        estimated_tokens_after: estimatedBefore,
+        model_context_window: params.contextWindowTokens,
+        high_watermark_limit: highWatermarkLimit,
+        target_limit: targetLimit,
+        anchor_event_index_before: 0,
+        anchor_event_index_after: 0,
+        delta_event_count: 0,
+        summary_state: cache.state.summary_state,
+      };
+    }
+
     this.emit("compaction.started", {
       session_id: params.session.id,
       turn_id: params.turnId,
       reason: params.reason,
-      anchor_event_index_before: anchorBefore,
-      event_count: cache.events.length,
+      anchor_event_index_before: 0,
+      event_count: historyBefore.length,
       context_window_tokens: params.contextWindowTokens,
     });
 
     try {
-      const modelCall: StructuredSummaryModelCall = async ({ systemInstruction, messages }) =>
-        this.runSummaryModelInference({
-          provider: params.provider,
-          systemInstruction,
-          messages,
-        });
-
-      const result = await runAnchoredCompaction({
-        reason: params.reason,
-        events: cache.events,
-        lastAnchorEventIndex: anchorBefore,
-        summaryState: cache.state.summary_state,
-        modelContextWindowTokens: params.contextWindowTokens,
-        pinnedTokenEstimate: estimatePinnedInstructionTokens(params.pinnedInstruction),
-        estimateHistoryTokens: estimateHistoryTokens,
-        summarizeDelta: ({ oldSummaryState, deltaEvents }) =>
-          summarizeDeltaWithModel({
-            callModel: modelCall,
-            oldSummaryState,
-            deltaEvents,
-          }),
-        force: params.force,
+      const inProgress = params.inProgressContext;
+      const compactionMessages: ChatMessage[] = [...historyBefore];
+      if (inProgress) {
+        const interruptionDetail = buildCompactionInterruptionDetail(inProgress);
+        if (interruptionDetail) {
+          compactionMessages.push({
+            role: "user",
+            text: interruptionDetail,
+          });
+        }
+      }
+      compactionMessages.push({
+        role: "user",
+        text: SIMPLE_COMPACTION_PROMPT,
       });
+
+      const summaryText = (
+        await this.runSummaryModelInference({
+          provider: params.provider,
+          systemInstruction: SIMPLE_COMPACTION_SYSTEM_PROMPT,
+          messages: compactionMessages,
+        })
+      ).trim();
+
+      if (!summaryText) {
+        throw new Error("compaction summarizer returned an empty summary");
+      }
+
+      const compactedMessage = [
+        "## Conversation Summary",
+        "",
+        summaryText,
+      ].join("\n");
+      params.session.history = [
+        {
+          role: "assistant",
+          text: compactedMessage,
+        },
+      ];
+      params.session.conversationProvider = params.provider;
+
+      cache.state.last_anchor_event_index = 0;
+      cache.state.summary_state = createEmptySummaryState();
+      cache.state.updated_at_iso = new Date().toISOString();
+      this.persistCompactionCache(cache);
+
+      const estimatedAfter = estimatePinnedInstructionTokens(params.pinnedInstruction) + estimateHistoryTokens(params.session.history);
+      const result: AnchoredCompactionResult = {
+        compressed: true,
+        reason: params.reason,
+        estimated_tokens_before: estimatedBefore,
+        estimated_tokens_after: estimatedAfter,
+        model_context_window: params.contextWindowTokens,
+        high_watermark_limit: highWatermarkLimit,
+        target_limit: targetLimit,
+        anchor_event_index_before: 0,
+        anchor_event_index_after: 0,
+        delta_event_count: historyBefore.length,
+        summary_state: cache.state.summary_state,
+      };
 
       this.emit("compaction.anchor_selected", {
         session_id: params.session.id,
@@ -669,16 +792,31 @@ export class LoafCoreRuntime {
         delta_event_count: result.delta_event_count,
       });
 
-      if (result.compressed) {
-        cache.state.last_anchor_event_index = result.anchor_event_index_after;
-        cache.state.summary_state = result.summary_state;
-        this.persistCompactionCache(cache);
-        this.emit("compaction.summary_merged", {
-          session_id: params.session.id,
-          turn_id: params.turnId,
-          summary_updated_at: cache.state.summary_state.updated_at_iso,
-          anchor_event_index_after: cache.state.last_anchor_event_index,
-        });
+      this.emit("compaction.summary_merged", {
+        session_id: params.session.id,
+        turn_id: params.turnId,
+        summary_updated_at: cache.state.summary_state.updated_at_iso,
+        anchor_event_index_after: cache.state.last_anchor_event_index,
+      });
+
+      if (params.session.activeSession) {
+        try {
+          params.session.activeSession = writeChatSession({
+            session: params.session.activeSession,
+            messages: params.session.history,
+            provider: params.provider,
+            model: this.selectedModel,
+            thinkingLevel: this.selectedThinking,
+            openRouterProvider:
+              params.provider === "openrouter"
+                ? normalizeOpenRouterProviderSelection(this.selectedOpenRouterProvider)
+                : undefined,
+            titleHint: "compressed conversation",
+          });
+          this.migrateCompactionCacheToRollout(params.session, params.session.activeSession.rolloutPath);
+        } catch {
+          // If compacted history fails to persist, keep in-memory compaction result.
+        }
       }
 
       this.emit("compaction.completed", {
@@ -764,12 +902,8 @@ export class LoafCoreRuntime {
   }
 
   private buildCompactionHistoryForModel(session: RuntimeSession, provider: AuthProvider): ChatMessage[] {
-    const cache = this.ensureCompactionCache(session, provider);
-    return buildModelContextMessages({
-      summaryState: cache.state.summary_state,
-      events: cache.events,
-      anchorEventIndex: cache.state.last_anchor_event_index,
-    });
+    void provider;
+    return [...session.history];
   }
 
   private captureCompactionDebugEvent(params: {
@@ -898,6 +1032,13 @@ export class LoafCoreRuntime {
       steeringQueue: [],
       activeAbortController: null,
       compaction: null,
+      activeTurnId: null,
+      activeTurnPrompt: "",
+      activeTurnAssistantDraft: "",
+      activeTurnDonePromise: null,
+      activeTurnDoneResolve: null,
+      pendingCompactionAfterInterrupt: false,
+      interruptedCompactionContext: null,
     };
 
     this.sessions.set(id, session);
@@ -946,6 +1087,22 @@ export class LoafCoreRuntime {
     imagesInput: RuntimeImageInput[];
   }): void {
     const { session, turnId } = input;
+    let turnDoneResolved = false;
+    const turnDonePromise = new Promise<void>((resolve) => {
+      session.activeTurnDoneResolve = () => {
+        if (turnDoneResolved) {
+          return;
+        }
+        turnDoneResolved = true;
+        resolve();
+      };
+    });
+    session.activeTurnDonePromise = turnDonePromise;
+    session.activeTurnId = turnId;
+    session.activeTurnPrompt = input.text.trim();
+    session.activeTurnAssistantDraft = "";
+    session.pendingCompactionAfterInterrupt = false;
+    session.interruptedCompactionContext = null;
     session.pending = true;
     session.statusLabel = "preparing...";
     session.steeringQueue = [];
@@ -971,9 +1128,17 @@ export class LoafCoreRuntime {
   }
 
   private finishSessionTurn(session: RuntimeSession): void {
+    const resolveTurnDone = session.activeTurnDoneResolve;
+    const suppressQueueDrain = session.pendingCompactionAfterInterrupt;
     const unappliedSteerCount = session.steeringQueue.length;
     session.steeringQueue = [];
     session.activeAbortController = null;
+    session.activeTurnId = null;
+    session.activeTurnPrompt = "";
+    session.activeTurnAssistantDraft = "";
+    session.activeTurnDonePromise = null;
+    session.activeTurnDoneResolve = null;
+    session.pendingCompactionAfterInterrupt = false;
     session.pending = false;
     session.statusLabel = "ready";
     session.updatedAt = new Date().toISOString();
@@ -982,12 +1147,13 @@ export class LoafCoreRuntime {
       pending: false,
       status_label: "ready",
     });
+    resolveTurnDone?.();
 
     if (unappliedSteerCount > 0) {
       this.appendSystemMessage(session, `${unappliedSteerCount} steer message(s) were queued too late and not applied.`);
     }
 
-    if (session.queuedPrompts.length > 0 && !this.shuttingDown) {
+    if (!suppressQueueDrain && session.queuedPrompts.length > 0 && !this.shuttingDown) {
       const queued = session.queuedPrompts.shift();
       if (queued) {
         this.startSessionTurn({
@@ -1030,17 +1196,8 @@ export class LoafCoreRuntime {
       };
     }
 
-    let source: "compaction" | "history" = "history";
-    let conversationTokens = estimateHistoryTokens(session.history);
-    if (session.compaction || session.activeSession) {
-      try {
-        const historyForModel = this.buildCompactionHistoryForModel(session, provider);
-        conversationTokens = estimateHistoryTokens(historyForModel);
-        source = "compaction";
-      } catch {
-        // keep history fallback estimate
-      }
-    }
+    const source: "compaction" | "history" = "history";
+    const conversationTokens = estimateHistoryTokens(session.history);
 
     const toolSchemaTokens = estimateToolSchemaTokensForProvider(provider);
     const providerOverheadTokens = PROVIDER_REQUEST_OVERHEAD_TOKENS[provider] ?? 0;
@@ -1420,6 +1577,13 @@ export class LoafCoreRuntime {
     if (session.history.length > 0) {
       const reason: CompactionReason = providerSwitchRequiresCompression ? "provider_switch" : "auto";
       try {
+        session.statusLabel = "compressing context...";
+        this.emit("session.status", {
+          session_id: session.id,
+          pending: true,
+          status_label: session.statusLabel,
+          turn_id: turnId,
+        });
         const compactionResult = await this.runSessionCompaction({
           session,
           provider,
@@ -1539,6 +1703,7 @@ export class LoafCoreRuntime {
         return;
       }
       assistantDraftText += deltaText;
+      session.activeTurnAssistantDraft = assistantDraftText;
     };
 
     const handleChunk = (chunk: StreamChunk) => {
@@ -1771,6 +1936,7 @@ export class LoafCoreRuntime {
     } catch (error) {
       const isAbort = error instanceof Error && error.name === "AbortError";
       if (isAbort) {
+        const compressionRequestedMidTurn = session.pendingCompactionAfterInterrupt;
         const interruptedAssistant = assistantDraftText.trim();
         const interruptedHistoryBase = [...nextHistory, ...appliedSteeringMessages];
         const interruptedHistory = interruptedAssistant
@@ -1816,10 +1982,19 @@ export class LoafCoreRuntime {
           });
         }
 
-        this.appendSystemMessage(
-          session,
-          interruptedAssistant ? "response interrupted by user. partial output kept." : "response interrupted by user.",
-        );
+        if (compressionRequestedMidTurn) {
+          session.interruptedCompactionContext = {
+            turnId,
+            userPrompt: promptWithImageRefs,
+            assistantDraft: interruptedAssistant,
+            interruptedAtIso: new Date().toISOString(),
+          };
+        } else {
+          this.appendSystemMessage(
+            session,
+            interruptedAssistant ? "response interrupted by user. partial output kept." : "response interrupted by user.",
+          );
+        }
 
         this.emit("session.interrupted", {
           session_id: session.id,
@@ -1828,23 +2003,135 @@ export class LoafCoreRuntime {
         });
       } else {
         const message = error instanceof Error ? error.message : String(error);
-        this.appendSystemMessage(session, `inference error: ${message}`);
-        this.appendCompactionEventSafe({
-          session,
-          provider,
-          type: "error_observed",
-          turnId,
-          cache: compactionCacheForTurn,
-          payload: {
+        const overflowDetected = isContextOverflowError(message);
+        if (overflowDetected) {
+          const interruptedAssistant = assistantDraftText.trim();
+          const interruptedHistoryBase = [...nextHistory, ...appliedSteeringMessages];
+          const interruptedHistory = interruptedAssistant
+            ? [...interruptedHistoryBase, { role: "assistant" as const, text: interruptedAssistant }]
+            : interruptedHistoryBase;
+          session.history = interruptedHistory;
+          session.conversationProvider = provider;
+
+          if (sessionForTurn) {
+            try {
+              session.activeSession = writeChatSession({
+                session: sessionForTurn,
+                messages: interruptedHistory,
+                provider,
+                model: this.selectedModel,
+                thinkingLevel: this.selectedThinking,
+                openRouterProvider: normalizedOpenRouterProvider,
+                titleHint: cleanPrompt,
+              });
+              this.migrateCompactionCacheToRollout(session, session.activeSession.rolloutPath);
+            } catch (persistError) {
+              const persistMessage = persistError instanceof Error ? persistError.message : String(persistError);
+              this.appendSystemMessage(session, `chat history save failed after overflow: ${persistMessage}`);
+            }
+          }
+
+          if (interruptedAssistant) {
+            this.appendSessionMessage(session, {
+              id: this.nextUiMessageId(),
+              kind: "assistant",
+              text: interruptedAssistant,
+            });
+            this.appendCompactionEventSafe({
+              session,
+              provider,
+              type: "assistant_msg",
+              turnId,
+              cache: compactionCacheForTurn,
+              payload: {
+                text: interruptedAssistant,
+                interrupted: true,
+                context_overflow: true,
+              },
+            });
+          }
+
+          this.appendCompactionEventSafe({
+            session,
+            provider,
+            type: "error_observed",
+            turnId,
+            cache: compactionCacheForTurn,
+            payload: {
+              message,
+              stage: "inference_context_overflow",
+            },
+          });
+
+          session.statusLabel = "compressing context...";
+          this.emit("session.status", {
+            session_id: session.id,
+            pending: true,
+            status_label: session.statusLabel,
+            turn_id: turnId,
+          });
+
+          try {
+            const compactionResult = await this.runSessionCompaction({
+              session,
+              provider,
+              reason: "auto",
+              contextWindowTokens: compressionBudget.contextWindowTokens,
+              force: true,
+              turnId,
+              pinnedInstruction: runtimeSystemInstruction,
+              inProgressContext: {
+                turnId,
+                userPrompt: promptWithImageRefs,
+                assistantDraft: interruptedAssistant,
+                interruptedAtIso: new Date().toISOString(),
+                overflowError: message,
+              },
+            });
+
+            if (compactionResult.compressed) {
+              this.appendSystemMessage(
+                session,
+                `context overflow detected; compressed context (${formatTokenCount(compactionResult.estimated_tokens_before)} -> ${formatTokenCount(compactionResult.estimated_tokens_after)} est. tokens). continuing...`,
+              );
+            }
+
+            session.queuedPrompts.unshift({
+              id: randomUUID(),
+              text: AUTO_CONTINUE_AFTER_COMPACTION_PROMPT,
+              images: [],
+              enqueuedAt: new Date().toISOString(),
+            });
+          } catch (compactionError) {
+            const compactionMessage =
+              compactionError instanceof Error ? compactionError.message : String(compactionError);
+            this.appendSystemMessage(session, `inference error: ${message}`);
+            this.appendSystemMessage(session, `auto-compression failed: ${compactionMessage}`);
+            this.emit("session.error", {
+              session_id: session.id,
+              turn_id: turnId,
+              message: compactionMessage,
+            });
+          }
+        } else {
+          this.appendSystemMessage(session, `inference error: ${message}`);
+          this.appendCompactionEventSafe({
+            session,
+            provider,
+            type: "error_observed",
+            turnId,
+            cache: compactionCacheForTurn,
+            payload: {
+              message,
+              stage: "inference",
+            },
+          });
+          this.emit("session.error", {
+            session_id: session.id,
+            turn_id: turnId,
             message,
-            stage: "inference",
-          },
-        });
-        this.emit("session.error", {
-          session_id: session.id,
-          turn_id: turnId,
-          message,
-        });
+          });
+        }
       }
     } finally {
       this.finishSessionTurn(session);
@@ -1972,6 +2259,31 @@ export class LoafCoreRuntime {
       if (!provider) {
         throw new Error("select a model first before running /compress");
       }
+      if (session.pending) {
+        session.pendingCompactionAfterInterrupt = true;
+        const activeController = session.activeAbortController;
+        if (activeController && !activeController.signal.aborted) {
+          activeController.abort();
+        }
+        session.statusLabel = "compressing context...";
+        this.emit("session.status", {
+          session_id: session.id,
+          pending: true,
+          status_label: session.statusLabel,
+        });
+        const turnDone = session.activeTurnDonePromise;
+        if (turnDone) {
+          await turnDone;
+        }
+      } else {
+        session.pending = true;
+        session.statusLabel = "compressing context...";
+        this.emit("session.status", {
+          session_id: session.id,
+          pending: true,
+          status_label: session.statusLabel,
+        });
+      }
       const budget = getCompressionBudgetForModel({
         modelId: this.selectedModel,
         provider,
@@ -1983,33 +2295,57 @@ export class LoafCoreRuntime {
         skillInstructionBlock: "",
         backgroundTaskNudgeBlock: buildBackgroundTaskNudgeInstruction(),
       });
-      const result = await this.runSessionCompaction({
-        session,
-        provider,
-        reason: "manual",
-        contextWindowTokens: budget.contextWindowTokens,
-        force: true,
-        pinnedInstruction: runtimeSystemInstruction,
-      });
-      if (result.compressed) {
-        this.appendSystemMessage(
+      const interruptedContext = session.interruptedCompactionContext ?? undefined;
+      session.interruptedCompactionContext = null;
+      try {
+        const result = await this.runSessionCompaction({
           session,
-          `context compression complete: ${formatTokenCount(result.estimated_tokens_before)} -> ${formatTokenCount(result.estimated_tokens_after)} est. tokens.`,
-        );
+          provider,
+          reason: "manual",
+          contextWindowTokens: budget.contextWindowTokens,
+          force: true,
+          pinnedInstruction: runtimeSystemInstruction,
+          inProgressContext: interruptedContext,
+        });
+        if (result.compressed) {
+          this.appendSystemMessage(
+            session,
+            `context compression complete: ${formatTokenCount(result.estimated_tokens_before)} -> ${formatTokenCount(result.estimated_tokens_after)} est. tokens.`,
+          );
+        }
+        return {
+          handled: true,
+          output: {
+            compressed: result.compressed,
+            reason: result.reason,
+            estimated_tokens_before: result.estimated_tokens_before,
+            estimated_tokens_after: result.estimated_tokens_after,
+            model_context_window: result.model_context_window,
+            target_limit: result.target_limit,
+            anchor_event_index_before: result.anchor_event_index_before,
+            anchor_event_index_after: result.anchor_event_index_after,
+          },
+        };
+      } finally {
+        session.pending = false;
+        session.statusLabel = "ready";
+        this.emit("session.status", {
+          session_id: session.id,
+          pending: false,
+          status_label: "ready",
+        });
+        if (session.queuedPrompts.length > 0 && !this.shuttingDown) {
+          const queued = session.queuedPrompts.shift();
+          if (queued) {
+            this.startSessionTurn({
+              session,
+              turnId: queued.id,
+              text: queued.text,
+              imagesInput: queued.images,
+            });
+          }
+        }
       }
-      return {
-        handled: true,
-        output: {
-          compressed: result.compressed,
-          reason: result.reason,
-          estimated_tokens_before: result.estimated_tokens_before,
-          estimated_tokens_after: result.estimated_tokens_after,
-          model_context_window: result.model_context_window,
-          target_limit: result.target_limit,
-          anchor_event_index_before: result.anchor_event_index_before,
-          anchor_event_index_after: result.anchor_event_index_after,
-        },
-      };
     }
 
     if (command === "/skills") {
@@ -2724,6 +3060,32 @@ function parseThoughtTitle(rawThought: string): string {
   return (firstLine || "reasoning").toLowerCase();
 }
 
+function buildCompactionInterruptionDetail(context: InProgressCompactionContext): string {
+  const prompt = context.userPrompt.trim();
+  const draft = context.assistantDraft.trim();
+  const overflowError = (context.overflowError ?? "").trim();
+  if (!prompt && !draft) {
+    return "";
+  }
+  const lines = [
+    "Compaction was requested while the assistant was mid-response.",
+    `Turn id: ${context.turnId}`,
+    `Interrupted at: ${context.interruptedAtIso}`,
+    "",
+    "Please include this in-progress context in the summary:",
+  ];
+  if (prompt) {
+    lines.push("", "## Active user prompt", prompt);
+  }
+  if (draft) {
+    lines.push("", "## Assistant partial draft", draft);
+  }
+  if (overflowError) {
+    lines.push("", "## Overflow error", overflowError);
+  }
+  return lines.join("\n");
+}
+
 function isLoafEasterEggTrigger(text: string): boolean {
   const normalized = collapseWhitespace(text)
     .toLowerCase()
@@ -3098,6 +3460,27 @@ function summarizeToolResult(value: unknown): string {
   } catch {
     return "";
   }
+}
+
+function isContextOverflowError(errorMessage: string): boolean {
+  const text = errorMessage.trim().toLowerCase();
+  if (!text) {
+    return false;
+  }
+  return (
+    text.includes("context length") ||
+    text.includes("context window") ||
+    text.includes("context limit") ||
+    text.includes("maximum context") ||
+    text.includes("max context") ||
+    text.includes("prompt is too long") ||
+    text.includes("input is too long") ||
+    text.includes("token limit") ||
+    text.includes("too many tokens") ||
+    text.includes("context overflow") ||
+    text.includes("context_length_exceeded") ||
+    text.includes("prompt_too_large")
+  );
 }
 
 function estimateToolSchemaTokensForProvider(provider: AuthProvider): number {

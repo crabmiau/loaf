@@ -107,16 +107,53 @@ export async function runAnchoredCompaction(input: AnchoredCompactionInput): Pro
     };
   }
 
-  const newAnchor = selectAnchorBoundary({
-    events,
-    anchorBefore,
-    summaryState: startSummary,
-    targetLimit,
-    pinnedTokenEstimate: input.pinnedTokenEstimate,
-    estimateHistoryTokens: input.estimateHistoryTokens,
-  });
+  const newAnchor = mustRun
+    ? selectForcedAnchorBoundary({
+        events,
+        anchorBefore,
+      })
+    : selectAnchorBoundary({
+        events,
+        anchorBefore,
+        summaryState: startSummary,
+        targetLimit,
+        pinnedTokenEstimate: input.pinnedTokenEstimate,
+        estimateHistoryTokens: input.estimateHistoryTokens,
+      });
 
   if (newAnchor <= anchorBefore) {
+    if (mustRun) {
+      const deltaEvents: CompactEvent[] = [];
+      const candidateSummary = await input.summarizeDelta({
+        oldSummaryState: startSummary,
+        deltaEvents,
+      });
+      const mergedSummary = mergeSummaryStates({
+        previous: startSummary,
+        candidate: candidateSummary,
+        deltaArtifactAdditions: extractArtifactsFromEvents(deltaEvents),
+      });
+      const estimatedAfter = estimateCompactionContextTokens({
+        summaryState: mergedSummary,
+        events,
+        anchorEventIndex: anchorBefore,
+        pinnedTokenEstimate: input.pinnedTokenEstimate,
+        estimateHistoryTokens: input.estimateHistoryTokens,
+      });
+      return {
+        compressed: true,
+        reason: input.reason,
+        estimated_tokens_before: estimatedBefore,
+        estimated_tokens_after: estimatedAfter,
+        model_context_window: input.modelContextWindowTokens,
+        high_watermark_limit: highWatermarkLimit,
+        target_limit: targetLimit,
+        anchor_event_index_before: anchorBefore,
+        anchor_event_index_after: anchorBefore,
+        delta_event_count: 0,
+        summary_state: mergedSummary,
+      };
+    }
     return {
       compressed: false,
       reason: input.reason,
@@ -179,9 +216,8 @@ function selectAnchorBoundary(params: {
     return params.anchorBefore;
   }
 
-  const minimumRecentStart = findMinimumRecentStart(events);
   let candidate = Math.max(params.anchorBefore, 0);
-  const maxCandidate = Math.max(candidate, minimumRecentStart);
+  const maxCandidate = maxAnchorCandidate(events, candidate);
   for (; candidate <= maxCandidate; candidate += 1) {
     const estimate = estimateCompactionContextTokens({
       summaryState: params.summaryState,
@@ -195,6 +231,19 @@ function selectAnchorBoundary(params: {
     }
   }
   return maxCandidate;
+}
+
+function selectForcedAnchorBoundary(params: { events: CompactEvent[]; anchorBefore: number }): number {
+  const candidate = Math.max(params.anchorBefore, 0);
+  return maxAnchorCandidate(params.events, candidate);
+}
+
+function maxAnchorCandidate(events: CompactEvent[], anchorBefore: number): number {
+  if (events.length === 0) {
+    return anchorBefore;
+  }
+  const minimumRecentStart = findMinimumRecentStart(events);
+  return Math.max(anchorBefore, minimumRecentStart);
 }
 
 function findMinimumRecentStart(events: CompactEvent[]): number {
