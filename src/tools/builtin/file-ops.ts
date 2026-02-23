@@ -1406,7 +1406,14 @@ function computePatchReplacements(
           error: `Failed to find context '${chunk.changeContext}' in ${filePath}`,
         };
       }
-      lineIndex = contextIndex + 1;
+      // Some patch generators repeat the @@ context line as the first context line
+      // in the hunk body. In that case, searching from contextIndex + 1 can skip
+      // the only valid match and produce a false "expected lines" failure.
+      const firstOldLine = chunk.oldLines[0];
+      lineIndex =
+        typeof firstOldLine === "string" && linesEquivalent(originalLines[contextIndex] ?? "", firstOldLine)
+          ? contextIndex
+          : contextIndex + 1;
     }
 
     if (chunk.oldLines.length === 0) {
@@ -1531,6 +1538,15 @@ function matchesPattern(
     }
   }
   return true;
+}
+
+function linesEquivalent(left: string, right: string): boolean {
+  return (
+    left === right ||
+    left.trimEnd() === right.trimEnd() ||
+    left.trim() === right.trim() ||
+    normalizePatchComparison(left) === normalizePatchComparison(right)
+  );
 }
 
 function normalizePatchComparison(value: string): string {

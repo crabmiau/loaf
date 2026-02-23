@@ -153,6 +153,46 @@ describe("file-ops built-in tools", () => {
     expect(next).toBe("foo\nbaz\n");
   });
 
+  it("apply_patch supports repeated @@ context line in update hunk body", async () => {
+    const dir = await createTempDir();
+    const target = path.join(dir, "imports.ts");
+    await fs.writeFile(
+      target,
+      [
+        "\"use client\";",
+        "",
+        "import { useState } from \"react\";",
+        "import { useCoins } from \"@/context/CoinContext\";",
+        "",
+        "export function Demo() {",
+        "  return null;",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const patch = [
+      "*** Begin Patch",
+      `*** Update File: ${target}`,
+      "@@ import { useCoins } from \"@/context/CoinContext\";",
+      " import { useCoins } from \"@/context/CoinContext\";",
+      "+import { useRigged } from \"@/context/RiggedContext\";",
+      "*** End Patch",
+    ].join("\n");
+
+    const applyPatchTool = getTool("apply_patch");
+    const result = await applyPatchTool.run(
+      { input: patch } as never,
+      { now: new Date() },
+    );
+
+    expect(result.ok).toBe(true);
+    const next = await fs.readFile(target, "utf8");
+    expect(next).toContain("import { useCoins } from \"@/context/CoinContext\";");
+    expect(next).toContain("import { useRigged } from \"@/context/RiggedContext\";");
+  });
+
   it("apply_patch can add and delete files", async () => {
     const dir = await createTempDir();
     const added = path.join(dir, "new-file.txt");
