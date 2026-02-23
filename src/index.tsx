@@ -53,6 +53,7 @@ import { listOpenRouterProvidersForModel, runOpenRouterInferenceStream } from ".
 import { configureBuiltinTools, defaultToolRegistry, loadCustomTools } from "./tools/index.js";
 import type { ChatImageAttachment, ChatMessage, DebugEvent, StreamChunk } from "./chat-types.js";
 import { buildToolReplacement, consumeAssistantBoundary, parseToolCallPreview } from "./interleaving.js";
+import { StreamingChunkingPolicy } from "./streaming-chunking.js";
 import {
   buildSkillPromptContext,
   loadSkillsCatalog,
@@ -67,6 +68,11 @@ type UiMessage = {
   kind: "user" | "assistant" | "system";
   text: string;
   images?: ChatImageAttachment[];
+};
+
+type StreamingQueuedLine = {
+  text: string;
+  queuedAtMs: number;
 };
 
 type AuthOption = {
@@ -274,6 +280,7 @@ const MAX_SELECTOR_WINDOW_SIZE = 16;
 const MIN_SUGGESTION_WINDOW_SIZE = 3;
 const MAX_SUGGESTION_WINDOW_SIZE = 12;
 const MIN_MESSAGE_ROWS_BUDGET = 3;
+const STREAM_COMMIT_TICK_MS = 8;
 const DEFAULT_TERMINAL_COLUMNS = 100;
 const DEFAULT_TERMINAL_ROWS = 24;
 const DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS_UI = 272_000;
@@ -423,6 +430,11 @@ function App() {
   const rpcEventUnsubscribeRef = useRef<(() => void) | null>(null);
   const streamingAssistantIdRef = useRef<number | null>(null);
   const streamingAssistantTextRef = useRef("");
+  const streamingAssistantEmittedCharsRef = useRef(0);
+  const streamingAssistantCollectorRef = useRef("");
+  const streamingAssistantQueuedLinesRef = useRef<StreamingQueuedLine[]>([]);
+  const streamingAssistantCommitTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const streamingChunkingPolicyRef = useRef(new StreamingChunkingPolicy());
   const pendingToolCallMessageIdsRef = useRef<number[]>([]);
 
   const terminalColumns = terminalViewport.columns;
@@ -504,6 +516,16 @@ function App() {
     setPending(state.pending);
     setStatusLabel(state.statusLabel || (state.pending ? "working..." : "ready"));
     setMessages(state.messages.map((message) => toUiMessage(message)));
+    streamingAssistantIdRef.current = null;
+    streamingAssistantTextRef.current = "";
+    streamingAssistantEmittedCharsRef.current = 0;
+    streamingAssistantCollectorRef.current = "";
+    streamingAssistantQueuedLinesRef.current = [];
+    streamingChunkingPolicyRef.current.reset();
+    if (streamingAssistantCommitTimerRef.current) {
+      clearInterval(streamingAssistantCommitTimerRef.current);
+      streamingAssistantCommitTimerRef.current = null;
+    }
     pendingToolCallMessageIdsRef.current = [];
     setHistory(state.history);
     setConversationProvider(state.conversationProvider);
@@ -743,10 +765,12 @@ function App() {
             text: delta,
           },
         ]);
+        streamingAssistantEmittedCharsRef.current += delta.length;
         return;
       }
 
       streamingAssistantTextRef.current += delta;
+      streamingAssistantEmittedCharsRef.current += delta.length;
       const nextText = streamingAssistantTextRef.current;
       setMessages((current) =>
         current.map((message) =>
@@ -760,32 +784,143 @@ function App() {
       );
     };
 
-    const finalizeStreamingAssistant = (text: string) => {
-      const existingId = streamingAssistantIdRef.current;
-      if (existingId === null) {
-        setMessages((current) => [
-          ...current,
-          {
-            id: nextMessageId(),
-            kind: "assistant",
-            text,
-          },
-        ]);
+    const clearStreamingCommitTimer = () => {
+      if (streamingAssistantCommitTimerRef.current) {
+        clearInterval(streamingAssistantCommitTimerRef.current);
+        streamingAssistantCommitTimerRef.current = null;
+      }
+    };
+
+    const enqueueCompleteCollectorLines = () => {
+      const collector = streamingAssistantCollectorRef.current;
+      if (!collector || !collector.includes("\n")) {
         return;
       }
+      const queuedLines = streamingAssistantQueuedLinesRef.current;
+      let remaining = collector;
+      const queuedAtMs = Date.now();
+      let newlineIndex = remaining.indexOf("\n");
+      while (newlineIndex >= 0) {
+        const nextLine = remaining.slice(0, newlineIndex + 1);
+        queuedLines.push({
+          text: nextLine,
+          queuedAtMs,
+        });
+        remaining = remaining.slice(newlineIndex + 1);
+        newlineIndex = remaining.indexOf("\n");
+      }
+      streamingAssistantCollectorRef.current = remaining;
+    };
 
-      setMessages((current) =>
-        current.map((message) =>
-          message.id === existingId
-            ? {
-                ...message,
-                text,
-              }
-            : message,
-        ),
-      );
+    const buildStreamingQueueSnapshot = () => {
+      const queuedLines = streamingAssistantQueuedLinesRef.current;
+      if (queuedLines.length === 0) {
+        return {
+          queuedLines: 0,
+          oldestQueuedAgeMs: null,
+        };
+      }
+      const oldestQueuedAtMs = queuedLines[0]?.queuedAtMs ?? Date.now();
+      return {
+        queuedLines: queuedLines.length,
+        oldestQueuedAgeMs: Math.max(0, Date.now() - oldestQueuedAtMs),
+      };
+    };
+
+    const commitQueuedStreamingLines = (maxLines: number) => {
+      if (maxLines <= 0) {
+        return;
+      }
+      const queue = streamingAssistantQueuedLinesRef.current;
+      if (queue.length === 0) {
+        return;
+      }
+      const drained = queue.splice(0, Math.min(maxLines, queue.length));
+      if (drained.length === 0) {
+        return;
+      }
+      appendStreamingDelta(drained.map((entry) => entry.text).join(""));
+    };
+
+    const runStreamingCommitTick = (scope: "any" | "catchup_only") => {
+      const snapshot = buildStreamingQueueSnapshot();
+      const drainCount = streamingChunkingPolicyRef.current.decide(snapshot, Date.now(), scope);
+      if (drainCount > 0) {
+        commitQueuedStreamingLines(drainCount);
+      }
+      if (streamingAssistantQueuedLinesRef.current.length === 0) {
+        clearStreamingCommitTimer();
+        streamingChunkingPolicyRef.current.decide(
+          {
+            queuedLines: 0,
+            oldestQueuedAgeMs: null,
+          },
+          Date.now(),
+          "any",
+        );
+      }
+    };
+
+    const ensureStreamingCommitTimer = () => {
+      if (streamingAssistantCommitTimerRef.current) {
+        return;
+      }
+      streamingAssistantCommitTimerRef.current = setInterval(() => {
+        runStreamingCommitTick("any");
+      }, STREAM_COMMIT_TICK_MS);
+    };
+
+    const queueStreamingDelta = (delta: string) => {
+      if (!delta) {
+        return;
+      }
+      streamingAssistantCollectorRef.current += delta;
+      enqueueCompleteCollectorLines();
+      if (streamingAssistantQueuedLinesRef.current.length === 0) {
+        return;
+      }
+      runStreamingCommitTick("catchup_only");
+      if (streamingAssistantQueuedLinesRef.current.length > 0) {
+        ensureStreamingCommitTimer();
+      }
+    };
+
+    const flushStreamingController = () => {
+      clearStreamingCommitTimer();
+      const collectorRemainder = streamingAssistantCollectorRef.current;
+      if (collectorRemainder) {
+        streamingAssistantQueuedLinesRef.current.push({
+          text: collectorRemainder,
+          queuedAtMs: Date.now(),
+        });
+        streamingAssistantCollectorRef.current = "";
+      }
+      const queue = streamingAssistantQueuedLinesRef.current;
+      if (queue.length > 0) {
+        appendStreamingDelta(queue.map((entry) => entry.text).join(""));
+        streamingAssistantQueuedLinesRef.current = [];
+      }
+      streamingChunkingPolicyRef.current.reset();
+    };
+
+    const splitStreamingAssistantAtBoundary = () => {
+      flushStreamingController();
       streamingAssistantIdRef.current = null;
       streamingAssistantTextRef.current = "";
+    };
+
+    const finalizeStreamingAssistant = (fullText: string) => {
+      flushStreamingController();
+      const boundary = consumeAssistantBoundary({
+        fullText,
+        emittedChars: streamingAssistantEmittedCharsRef.current,
+      });
+      if (boundary.delta) {
+        appendStreamingDelta(boundary.delta);
+      }
+      streamingAssistantIdRef.current = null;
+      streamingAssistantTextRef.current = "";
+      streamingAssistantEmittedCharsRef.current = 0;
     };
 
     const handleRuntimeEvent = (event: RuntimeEvent) => {
@@ -830,15 +965,36 @@ function App() {
         setPending(nextPending);
         setStatusLabel(label);
         if (!nextPending) {
+          clearStreamingCommitTimer();
+          streamingAssistantCollectorRef.current = "";
+          streamingAssistantQueuedLinesRef.current = [];
+          streamingChunkingPolicyRef.current.reset();
           streamingAssistantIdRef.current = null;
           streamingAssistantTextRef.current = "";
+          streamingAssistantEmittedCharsRef.current = 0;
         }
         return;
       }
 
       if (event.type === "session.stream.chunk") {
-        // Runtime emits final assistant rows via session.message.appended.
-        // Skip chunk-level rendering to avoid duplicate deltas.
+        const chunk = payload.chunk as StreamChunk | undefined;
+        if (!chunk) {
+          return;
+        }
+
+        const segments = Array.isArray(chunk.segments) ? chunk.segments : [];
+        if (segments.length > 0) {
+          for (const segment of segments) {
+            if (segment.kind === "answer" && segment.text) {
+              queueStreamingDelta(segment.text);
+            }
+          }
+          return;
+        }
+
+        if (chunk.answerText) {
+          queueStreamingDelta(chunk.answerText);
+        }
         return;
       }
 
@@ -872,6 +1028,7 @@ function App() {
       }
 
       if (event.type === "session.tool.call.started") {
+        splitStreamingAssistantAtBoundary();
         const row = formatToolStartRow(payload.data);
         if (row) {
           const messageId = nextMessageId();
@@ -1022,6 +1179,13 @@ function App() {
 
     return () => {
       cancelled = true;
+      if (streamingAssistantCommitTimerRef.current) {
+        clearInterval(streamingAssistantCommitTimerRef.current);
+        streamingAssistantCommitTimerRef.current = null;
+      }
+      streamingAssistantCollectorRef.current = "";
+      streamingAssistantQueuedLinesRef.current = [];
+      streamingChunkingPolicyRef.current.reset();
       const unsubscribe = rpcEventUnsubscribeRef.current;
       rpcEventUnsubscribeRef.current = null;
       unsubscribe?.();

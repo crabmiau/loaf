@@ -1473,15 +1473,6 @@ export class LoafCoreRuntime {
         return;
       }
       assistantDraftText += deltaText;
-      this.emit("session.stream.chunk", {
-        session_id: session.id,
-        turn_id: turnId,
-        chunk: {
-          thoughts: [],
-          answerText: deltaText,
-          segments: [{ kind: "answer", text: deltaText }],
-        } satisfies StreamChunk,
-      });
     };
 
     const handleChunk = (chunk: StreamChunk) => {
