@@ -7,7 +7,8 @@ this folder contains the tool system used by `loaf`.
 - `types.ts`: shared tool contracts (`ToolDefinition`, `ToolCall`, `ToolResult`)
 - `registry.ts`: registration + lookup (`ToolRegistry`)
 - `runtime.ts`: execution wrapper (`ToolRuntime`)
-- `builtin/bash.ts`: stateful shell command tool (`bash`)
+- `builtin/bash.ts`: stateful shell command tool (`bash`) + background session tools (`read_background_bash`, `write_background_bash`, `stop_background_bash`, `list_background_bash`)
+- `builtin/file-ops.ts`: Codex-style filesystem tools (`read_file`, `list_dir`, `grep_files`, `apply_patch`)
 - `builtin/javascript.ts`: js-first tools (`run_js`, `install_js_packages`, `run_js_module`, background session tools)
 - `builtin/persistent-tool.ts`: built-in tool for writing+autoloading persistent tools
 - `custom.ts`: loader for user-provided js tools

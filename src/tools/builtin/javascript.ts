@@ -112,6 +112,20 @@ type BackgroundSession = {
   child: ReturnType<typeof spawn>;
 };
 
+export type BackgroundJsSessionSnapshot = {
+  session_id: string;
+  session_name: string;
+  running: boolean;
+  status: BackgroundSessionStatus;
+  command: string;
+  args: string[];
+  cwd: string;
+  created_at: string;
+  updated_at: string;
+  unread_stdout_chars: number;
+  unread_stderr_chars: number;
+};
+
 const MAX_CAPTURE_CHARS = 300_000;
 const MAX_BACKGROUND_CAPTURE_CHARS = 300_000;
 const DEFAULT_BACKGROUND_READ_CHARS = 8_000;
@@ -782,6 +796,28 @@ export const JAVASCRIPT_BUILTIN_TOOLS: ToolDefinition[] = [
   stopBackgroundJsTool,
   listBackgroundJsTool,
 ];
+
+export function listBackgroundJsSessionSnapshots(params?: {
+  include_exited?: boolean;
+}): BackgroundJsSessionSnapshot[] {
+  const includeExited = params?.include_exited === true;
+  return Array.from(backgroundSessions.values())
+    .filter((session) => includeExited || session.status === "running")
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+    .map((session) => ({
+      session_id: session.id,
+      session_name: session.name,
+      running: session.status === "running",
+      status: session.status,
+      command: session.command,
+      args: [...session.args],
+      cwd: session.cwd,
+      created_at: session.createdAt,
+      updated_at: session.updatedAt,
+      unread_stdout_chars: unreadBackgroundChars(session.stdout),
+      unread_stderr_chars: unreadBackgroundChars(session.stderr),
+    }));
+}
 
 function normalizeScriptRuntime(value: JsonValue | undefined): "auto" | ScriptRuntime {
   if (typeof value !== "string") {

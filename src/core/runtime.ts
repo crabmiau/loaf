@@ -49,6 +49,8 @@ import {
 import { fetchOpenAiUsageSnapshot, runOpenAiInferenceStream, type OpenAiUsageSnapshot } from "../openai.js";
 import { listOpenRouterProvidersForModel, runOpenRouterInferenceStream } from "../openrouter.js";
 import { configureBuiltinTools, defaultToolRegistry, loadCustomTools } from "../tools/index.js";
+import { listBackgroundBashSessionSnapshots } from "../tools/builtin/bash.js";
+import { listBackgroundJsSessionSnapshots } from "../tools/builtin/javascript.js";
 import type { ChatImageAttachment, ChatMessage, DebugEvent, StreamChunk } from "../chat-types.js";
 import { buildSkillPromptContext, loadSkillsCatalog, mapMessagesForModel, type SkillDefinition } from "../skills/index.js";
 import {
@@ -948,6 +950,7 @@ export class LoafCoreRuntime {
       baseInstruction: loafConfig.systemInstruction,
       hasExaSearch: Boolean(this.exaApiKey.trim()),
       skillInstructionBlock: "",
+      backgroundTaskNudgeBlock: buildBackgroundTaskNudgeInstruction(),
     });
     const pinnedTokens = estimatePinnedInstructionTokens(baseInstruction);
 
@@ -1336,6 +1339,7 @@ export class LoafCoreRuntime {
       baseInstruction: loafConfig.systemInstruction,
       hasExaSearch: Boolean(this.exaApiKey.trim()),
       skillInstructionBlock: skillPromptContext.instructionBlock,
+      backgroundTaskNudgeBlock: buildBackgroundTaskNudgeInstruction(),
     });
 
     const compressionBudget = getCompressionBudgetForModel({
@@ -1923,6 +1927,7 @@ export class LoafCoreRuntime {
         baseInstruction: loafConfig.systemInstruction,
         hasExaSearch: Boolean(this.exaApiKey.trim()),
         skillInstructionBlock: "",
+        backgroundTaskNudgeBlock: buildBackgroundTaskNudgeInstruction(),
       });
       const result = await this.runSessionCompaction({
         session,
@@ -2275,6 +2280,7 @@ export class LoafCoreRuntime {
           baseInstruction: loafConfig.systemInstruction,
           hasExaSearch: Boolean(this.exaApiKey.trim()),
           skillInstructionBlock: "",
+          backgroundTaskNudgeBlock: buildBackgroundTaskNudgeInstruction(),
         });
         const result = await this.runSessionCompaction({
           session,
@@ -2789,6 +2795,7 @@ function buildRuntimeSystemInstruction(params: {
   baseInstruction: string;
   hasExaSearch: boolean;
   skillInstructionBlock?: string;
+  backgroundTaskNudgeBlock?: string;
 }): string {
   const base = params.baseInstruction.trim();
   const sections = [base];
@@ -2798,12 +2805,60 @@ function buildRuntimeSystemInstruction(params: {
   }
   sections.push(OS_PROMPT_EXTENSION);
 
+  const backgroundTaskNudgeBlock = params.backgroundTaskNudgeBlock?.trim() ?? "";
+  if (backgroundTaskNudgeBlock) {
+    sections.push(backgroundTaskNudgeBlock);
+  }
+
   const skillInstructionBlock = params.skillInstructionBlock?.trim() ?? "";
   if (skillInstructionBlock) {
     sections.push(skillInstructionBlock);
   }
 
   return sections.filter(Boolean).join("\n\n").trim();
+}
+
+function buildBackgroundTaskNudgeInstruction(): string {
+  const runningJs = listBackgroundJsSessionSnapshots()
+    .filter((session) => session.running)
+    .slice(0, 4);
+  const runningBash = listBackgroundBashSessionSnapshots()
+    .filter((session) => session.running)
+    .slice(0, 4);
+
+  if (runningJs.length === 0 && runningBash.length === 0) {
+    return "";
+  }
+
+  const lines: string[] = [
+    "<background_task_nudge>",
+    "one or more background sessions are still running from previous tool calls.",
+    "before starting duplicate work or declaring completion, check these sessions for new output.",
+    "use read_background_js/read_background_bash to poll output.",
+    "if input is needed, use write_background_js/write_background_bash.",
+    "stop stale sessions with stop_background_js/stop_background_bash when they are no longer needed.",
+  ];
+
+  if (runningJs.length > 0) {
+    lines.push("running js sessions:");
+    for (const session of runningJs) {
+      lines.push(
+        `- ${session.session_name} (${session.session_id}) unread_stdout=${session.unread_stdout_chars} unread_stderr=${session.unread_stderr_chars}`,
+      );
+    }
+  }
+
+  if (runningBash.length > 0) {
+    lines.push("running bash sessions:");
+    for (const session of runningBash) {
+      lines.push(
+        `- ${session.session_name} (${session.session_id}) unread_stdout=${session.unread_stdout_chars} unread_stderr=${session.unread_stderr_chars}`,
+      );
+    }
+  }
+
+  lines.push("</background_task_nudge>");
+  return lines.join("\n");
 }
 
 function buildOsPromptExtension(): string {

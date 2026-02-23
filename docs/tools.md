@@ -8,7 +8,18 @@ Use `/tools` inside `loaf` to view the currently registered tool list.
 
 ### Shell
 
-- `bash`: run shell commands with session-persisted cwd/env state.
+- `bash`: run shell commands with session-persisted cwd/env state (`run_in_background=true` for async mode).
+- `read_background_bash`: read buffered stdout/stderr from background bash sessions.
+- `write_background_bash`: write stdin to a running background bash session.
+- `stop_background_bash`: stop a background bash session.
+- `list_background_bash`: list background bash sessions.
+
+### File operations (Codex-style)
+
+- `read_file`: read local files with numbered lines (`slice` and `indentation` modes).
+- `list_dir`: list local directory entries with depth/offset/limit controls.
+- `grep_files`: search files by regex via `rg --files-with-matches`.
+- `apply_patch`: apply Codex patch format (`*** Begin Patch` / `*** End Patch`).
 
 ### Web search
 

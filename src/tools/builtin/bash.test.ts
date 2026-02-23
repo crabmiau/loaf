@@ -2,7 +2,10 @@ import path from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { BASH_BUILTIN_TOOLS } from "./bash.js";
 
-const bashTool = getBashTool();
+const bashTool = getTool("bash");
+const readBackgroundBashTool = getTool("read_background_bash");
+const stopBackgroundBashTool = getTool("stop_background_bash");
+const listBackgroundBashTool = getTool("list_background_bash");
 
 type ShellName = "zsh" | "bash" | "sh" | "powershell" | "cmd";
 
@@ -107,16 +110,104 @@ describe("bash built-in tool", () => {
     expect(output.truncated_stdout).toBe(true);
     expect(readTrimmedString(output.stdout).length).toBeGreaterThan(0);
   });
+
+  it("can run bash in background and read completion output", async () => {
+    const first = await runBash({ command: shellEcho("detect-shell") });
+    const shell = readShellName(asRecord(first.output));
+
+    const started = await runBash({
+      command: shellBackgroundComplete(shell),
+      run_in_background: true,
+      session_name: "bash-bg-read-test",
+    });
+    expect(started.ok).toBe(true);
+    const startedOutput = asRecord(started.output);
+    const sessionId = readTrimmedString(startedOutput.session_id);
+    expect(sessionId).toBeTruthy();
+
+    await sleepMs(1300);
+    const read = await readBackgroundBash(sessionId, {
+      max_chars: 12000,
+    });
+    expect(read.ok).toBe(true);
+    const readOutput = asRecord(read.output);
+    expect(readTrimmedString(readOutput.stdout)).toContain("bg-finished");
+  });
+
+  it("lists and stops running background bash sessions", async () => {
+    const first = await runBash({ command: shellEcho("detect-shell") });
+    const shell = readShellName(asRecord(first.output));
+
+    const started = await runBash({
+      command: shellLongSleep(shell),
+      run_in_background: true,
+      session_name: "bash-bg-stop-test",
+      reuse_session: false,
+    });
+    expect(started.ok).toBe(true);
+    const startedOutput = asRecord(started.output);
+    const sessionId = readTrimmedString(startedOutput.session_id);
+    expect(sessionId).toBeTruthy();
+
+    const listedBeforeStop = await listBackgroundBash();
+    expect(listedBeforeStop.ok).toBe(true);
+    const beforeRecord = asRecord(listedBeforeStop.output);
+    const beforeSessions = Array.isArray(beforeRecord.sessions) ? beforeRecord.sessions : [];
+    expect(
+      beforeSessions.some(
+        (entry) => isRecord(entry) && readTrimmedString(entry.session_id) === sessionId,
+      ),
+    ).toBe(true);
+
+    const stopped = await stopBackgroundBash(sessionId, {
+      force: true,
+    });
+    expect(stopped.ok).toBe(true);
+
+    await sleepMs(300);
+    const listedAfterStop = await listBackgroundBash({ include_exited: true });
+    expect(listedAfterStop.ok).toBe(true);
+    const afterRecord = asRecord(listedAfterStop.output);
+    const afterSessions = Array.isArray(afterRecord.sessions) ? afterRecord.sessions : [];
+    const sessionEntry = afterSessions.find(
+      (entry) => isRecord(entry) && readTrimmedString(entry.session_id) === sessionId,
+    );
+    expect(sessionEntry && isRecord(sessionEntry) ? sessionEntry.running : undefined).toBe(false);
+  });
 });
 
 async function runBash(input: Record<string, unknown>) {
   return bashTool.run(input as never, { now: new Date() });
 }
 
-function getBashTool() {
-  const tool = BASH_BUILTIN_TOOLS.find((entry) => entry.name === "bash");
+async function readBackgroundBash(sessionId: string, extra: Record<string, unknown> = {}) {
+  return readBackgroundBashTool.run(
+    {
+      session_id: sessionId,
+      ...extra,
+    } as never,
+    { now: new Date() },
+  );
+}
+
+async function stopBackgroundBash(sessionId: string, extra: Record<string, unknown> = {}) {
+  return stopBackgroundBashTool.run(
+    {
+      session_id: sessionId,
+      ...extra,
+    } as never,
+    { now: new Date() },
+  );
+}
+
+async function listBackgroundBash(input: Record<string, unknown> = {}) {
+  return listBackgroundBashTool.run(input as never, { now: new Date() });
+}
+
+function getTool(name: string) {
+  const tool = BASH_BUILTIN_TOOLS.find((entry) => entry.name === name);
   if (!tool) {
-    throw new Error("bash tool not found");
+    throw new Error(`tool not found: ${name}`);
   }
   return tool;
 }
@@ -126,6 +217,10 @@ function asRecord(value: unknown): Record<string, unknown> {
     throw new Error("expected object output");
   }
   return value as Record<string, unknown>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function readTrimmedString(value: unknown): string {
@@ -216,4 +311,30 @@ function shellLargeOutput(shell: ShellName): string {
     return "[Console]::Out.Write(('x' * 305000))";
   }
   return "yes x | head -c 305000";
+}
+
+function shellBackgroundComplete(shell: ShellName): string {
+  if (shell === "powershell") {
+    return "Start-Sleep -Seconds 1; Write-Output bg-finished";
+  }
+  if (shell === "cmd") {
+    return "ping 127.0.0.1 -n 2 > nul & echo bg-finished";
+  }
+  return "sleep 1; echo bg-finished";
+}
+
+function shellLongSleep(shell: ShellName): string {
+  if (shell === "powershell") {
+    return "Start-Sleep -Seconds 30";
+  }
+  if (shell === "cmd") {
+    return "ping 127.0.0.1 -n 31 > nul";
+  }
+  return "sleep 30";
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }

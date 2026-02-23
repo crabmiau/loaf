@@ -1,6 +1,7 @@
 import { loafConfig } from "../config.js";
 import { BASH_BUILTIN_TOOLS } from "./builtin/bash.js";
 import { createExaBuiltinTools } from "./builtin/exa.js";
+import { FILE_OPS_BUILTIN_TOOLS } from "./builtin/file-ops.js";
 import { createPersistentToolTool } from "./builtin/persistent-tool.js";
 import { discoverCustomTools } from "./custom.js";
 import { JAVASCRIPT_BUILTIN_TOOLS } from "./builtin/javascript.js";
@@ -19,6 +20,7 @@ const EXA_BUILTIN_TOOLS = createExaBuiltinTools({
 
 const registry = createToolRegistry()
   .registerMany(BASH_BUILTIN_TOOLS)
+  .registerMany(FILE_OPS_BUILTIN_TOOLS)
   .registerMany(JAVASCRIPT_BUILTIN_TOOLS)
   .registerMany(EXA_BUILTIN_TOOLS);
 let builtinToolNames = new Set(registry.list().map((tool) => tool.name));
