@@ -4,6 +4,8 @@ import { BASH_BUILTIN_TOOLS } from "./bash.js";
 
 const bashTool = getTool("bash");
 const readBackgroundBashTool = getTool("read_background_bash");
+const writeBackgroundBashTool = getTool("write_background_bash");
+const resizeBackgroundBashTool = getTool("resize_background_bash");
 const stopBackgroundBashTool = getTool("stop_background_bash");
 const listBackgroundBashTool = getTool("list_background_bash");
 
@@ -194,6 +196,114 @@ describe("bash built-in tool", () => {
     );
     expect(sessionEntry && isRecord(sessionEntry) ? sessionEntry.running : undefined).toBe(false);
   });
+
+  it("supports full terminal PTY input with key presses", async () => {
+    const first = await runBash({ command: shellEcho("detect-shell") });
+    const shell = readShellName(asRecord(first.output));
+
+    const started = await runBash({
+      command: shellInteractiveReadAndEcho(shell),
+      run_in_background: true,
+      full_terminal: true,
+      reuse_session: false,
+      session_name: "bash-bg-pty-input-test",
+    });
+    expect(started.ok).toBe(true);
+    const startedOutput = asRecord(started.output);
+    const sessionId = readTrimmedString(startedOutput.session_id);
+    expect(sessionId).toBeTruthy();
+    expect(startedOutput.transport).toBe("pty");
+
+    const writeText = await writeBackgroundBash(sessionId, {
+      input: "loaf-pty",
+      append_newline: false,
+    });
+    expect(writeText.ok).toBe(true);
+    const writeEnter = await writeBackgroundBash(sessionId, {
+      key: "enter",
+    });
+    expect(writeEnter.ok).toBe(true);
+
+    const stdout = await waitForBackgroundStdout(sessionId, "value:loaf-pty", 5_000);
+    expect(stdout.toLowerCase()).toContain("value:loaf-pty");
+  });
+
+  it("resizes PTY sessions and rejects resize for pipe sessions", async () => {
+    const first = await runBash({ command: shellEcho("detect-shell") });
+    const shell = readShellName(asRecord(first.output));
+
+    const ptyStarted = await runBash({
+      command: shellLongSleep(shell),
+      run_in_background: true,
+      full_terminal: true,
+      reuse_session: false,
+      session_name: "bash-bg-pty-resize-test",
+    });
+    expect(ptyStarted.ok).toBe(true);
+    const ptyStartedOutput = asRecord(ptyStarted.output);
+    const ptySessionId = readTrimmedString(ptyStartedOutput.session_id);
+    expect(ptySessionId).toBeTruthy();
+
+    const resized = await resizeBackgroundBash(ptySessionId, {
+      cols: 140,
+      rows: 50,
+    });
+    expect(resized.ok).toBe(true);
+    const resizedOutput = asRecord(resized.output);
+    expect(resizedOutput.terminal_cols).toBe(140);
+    expect(resizedOutput.terminal_rows).toBe(50);
+
+    const pipeStarted = await runBash({
+      command: shellLongSleep(shell),
+      run_in_background: true,
+      full_terminal: false,
+      reuse_session: false,
+      session_name: "bash-bg-pipe-resize-test",
+    });
+    expect(pipeStarted.ok).toBe(true);
+    const pipeStartedOutput = asRecord(pipeStarted.output);
+    const pipeSessionId = readTrimmedString(pipeStartedOutput.session_id);
+    expect(pipeSessionId).toBeTruthy();
+
+    const pipeResize = await resizeBackgroundBash(pipeSessionId, {
+      cols: 100,
+      rows: 30,
+    });
+    expect(pipeResize.ok).toBe(false);
+    const pipeResizeOutput = asRecord(pipeResize.output);
+    expect(pipeResizeOutput.status).toBe("unsupported");
+
+    await stopBackgroundBash(ptySessionId, { force: true });
+    await stopBackgroundBash(pipeSessionId, { force: true });
+  });
+
+  it("starts full terminal background sessions even when PATH is cleared on windows", async () => {
+    if (process.platform !== "win32") {
+      return;
+    }
+
+    const first = await runBash({ command: shellEcho("detect-shell") });
+    const shell = readShellName(asRecord(first.output));
+
+    await runBash({ command: shellClearPath(shell) });
+
+    const started = await runBash({
+      command: shellEcho("pty-path-ok"),
+      run_in_background: true,
+      full_terminal: true,
+      reuse_session: false,
+      cwd: "C:/testdir",
+      session_name: "bash-bg-pty-path-test",
+    });
+    expect(started.ok).toBe(true);
+    const startedOutput = asRecord(started.output);
+    expect(startedOutput.transport).toBe("pty");
+
+    const sessionId = readTrimmedString(startedOutput.session_id);
+    expect(sessionId).toBeTruthy();
+    const stdout = await waitForBackgroundStdout(sessionId, "pty-path-ok", 5_000);
+    expect(stdout.toLowerCase()).toContain("pty-path-ok");
+  });
 });
 
 async function runBash(input: Record<string, unknown>) {
@@ -202,6 +312,26 @@ async function runBash(input: Record<string, unknown>) {
 
 async function readBackgroundBash(sessionId: string, extra: Record<string, unknown> = {}) {
   return readBackgroundBashTool.run(
+    {
+      session_id: sessionId,
+      ...extra,
+    } as never,
+    { now: new Date() },
+  );
+}
+
+async function writeBackgroundBash(sessionId: string, extra: Record<string, unknown> = {}) {
+  return writeBackgroundBashTool.run(
+    {
+      session_id: sessionId,
+      ...extra,
+    } as never,
+    { now: new Date() },
+  );
+}
+
+async function resizeBackgroundBash(sessionId: string, extra: Record<string, unknown> = {}) {
+  return resizeBackgroundBashTool.run(
     {
       session_id: sessionId,
       ...extra,
@@ -361,6 +491,45 @@ function shellLongSleep(shell: ShellName): string {
     return "ping 127.0.0.1 -n 31 > nul";
   }
   return "sleep 30";
+}
+
+function shellInteractiveReadAndEcho(shell: ShellName): string {
+  if (shell === "powershell") {
+    return "$v = Read-Host 'value'; Write-Output (\"value:\" + $v)";
+  }
+  if (shell === "cmd") {
+    return "set /p V=value: & echo value:%V%";
+  }
+  return "read V; echo value:$V";
+}
+
+function shellClearPath(shell: ShellName): string {
+  if (shell === "powershell") {
+    return "$env:Path=''; Write-Output path-cleared";
+  }
+  if (shell === "cmd") {
+    return "set PATH= & echo path-cleared";
+  }
+  return "PATH=''; export PATH; echo path-cleared";
+}
+
+async function waitForBackgroundStdout(
+  sessionId: string,
+  needle: string,
+  timeoutMs: number,
+): Promise<string> {
+  const startedAt = Date.now();
+  let collected = "";
+  while (Date.now() - startedAt < timeoutMs) {
+    const read = await readBackgroundBash(sessionId, { max_chars: 12000 });
+    const output = asRecord(read.output);
+    collected += readTrimmedString(output.stdout);
+    if (collected.toLowerCase().includes(needle.toLowerCase())) {
+      return collected;
+    }
+    await sleepMs(120);
+  }
+  return collected;
 }
 
 function sleepMs(ms: number): Promise<void> {

@@ -10,7 +10,8 @@ Use `/tools` inside `loaf` to view the currently registered tool list.
 
 - `bash`: run shell commands with session-persisted cwd/env state (`run_in_background=true` for async mode).
 - `read_background_bash`: read buffered stdout/stderr from background bash sessions.
-- `write_background_bash`: write stdin to a running background bash session.
+- `write_background_bash`: write text or special key input (`enter`, arrows, `ctrl+c`, etc.) to a running background bash session.
+- `resize_background_bash`: resize a PTY-backed background bash session (`full_terminal=true`).
 - `stop_background_bash`: stop a background bash session.
 - `list_background_bash`: list background bash sessions.
 

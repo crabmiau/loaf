@@ -4144,24 +4144,22 @@ function formatRunJsModuleDetail(payload: Record<string, unknown>, record: Recor
 }
 
 function formatBashDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
-  const command = readTrimmedString(payload.command);
   const output = getCombinedProcessOutput(record);
-  const cwdAfter = readTrimmedString(record.cwd_after);
-
-  const commandPrefix = command ? `${clipInline(command, 120)} | ` : "";
-  const cwdSuffix = cwdAfter ? ` | cwd: ${clipInline(cwdAfter, 80)}` : "";
+  const sessionId = readTrimmedString(record.session_id);
+  const sessionName = readTrimmedString(record.session_name);
 
   if (output) {
-    const firstLine = output
-      .replace(/\r\n/g, "\n")
-      .split("\n")
-      .map((line) => line.trim())
-      .find(Boolean);
-    if (firstLine) {
-      return `${commandPrefix}${clipInline(firstLine, 160)}${cwdSuffix}`.trim();
-    }
+    return output;
   }
-  return `${commandPrefix}no stdout/stderr${cwdSuffix}`.trim();
+
+  if (sessionId && sessionName) {
+    return `${sessionName} (${sessionId})`;
+  }
+  if (sessionId) {
+    return sessionId;
+  }
+
+  return "(no output)";
 }
 
 function formatSearchWebDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
