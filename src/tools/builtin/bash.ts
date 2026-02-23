@@ -42,6 +42,7 @@ type ProcessRunResult = {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  aborted: boolean;
   durationMs: number;
   truncatedStdout: boolean;
   truncatedStderr: boolean;
@@ -167,7 +168,7 @@ const bashTool: ToolDefinition<BashInput> = {
     required: ["command"],
     additionalProperties: false,
   },
-  run: async (input, _context): Promise<ToolResult> => {
+  run: async (input, context): Promise<ToolResult> => {
     const commandText = asNonEmptyString(input.command);
     if (!commandText) {
       return invalidInput("bash requires a non-empty `command` string.");
@@ -320,6 +321,7 @@ const bashTool: ToolDefinition<BashInput> = {
       cwd: cwdBefore,
       env: envBefore,
       timeoutMs,
+      signal: context.signal,
     });
 
     const parsed = parseShellStateCapture(processResult.stdout, markerPrefix);
@@ -342,6 +344,7 @@ const bashTool: ToolDefinition<BashInput> = {
       exit_code: processResult.exitCode,
       signal: processResult.signal ?? null,
       timed_out: processResult.timedOut,
+      aborted: processResult.aborted,
       duration_ms: processResult.durationMs,
       stdout: parsed.cleanedStdout,
       stderr: processResult.stderr,
@@ -1020,6 +1023,9 @@ function invalidInput(message: string): ToolResult {
 
 function summarizeProcessError(result: ProcessRunResult): string {
   const codeLabel = result.exitCode === null ? "no exit code" : `exit code ${result.exitCode}`;
+  if (result.aborted) {
+    return `process aborted (${codeLabel})`;
+  }
   if (result.timedOut) {
     return `process timed out (${codeLabel})`;
   }
@@ -1052,6 +1058,7 @@ async function runCommand(
     cwd?: string;
     env?: NodeJS.ProcessEnv;
     timeoutMs?: number;
+    signal?: AbortSignal;
   } = {},
 ): Promise<ProcessRunResult> {
   const cwd = options.cwd || process.cwd();
@@ -1065,6 +1072,7 @@ async function runCommand(
   let truncatedStdout = false;
   let truncatedStderr = false;
   let timedOut = false;
+  let aborted = false;
 
   const child = spawn(command, args, {
     cwd,
@@ -1073,7 +1081,7 @@ async function runCommand(
     windowsHide: true,
   });
 
-  child.stdout?.on("data", (chunk) => {
+  const onStdout = (chunk: unknown) => {
     const next = `${stdout}${String(chunk)}`;
     if (next.length > MAX_CAPTURE_CHARS) {
       stdout = next.slice(0, MAX_CAPTURE_CHARS);
@@ -1081,9 +1089,10 @@ async function runCommand(
     } else {
       stdout = next;
     }
-  });
+  };
+  child.stdout?.on("data", onStdout);
 
-  child.stderr?.on("data", (chunk) => {
+  const onStderr = (chunk: unknown) => {
     const next = `${stderr}${String(chunk)}`;
     if (next.length > MAX_CAPTURE_CHARS) {
       stderr = next.slice(0, MAX_CAPTURE_CHARS);
@@ -1091,15 +1100,22 @@ async function runCommand(
     } else {
       stderr = next;
     }
-  });
+  };
+  child.stderr?.on("data", onStderr);
+
+  const terminate = (signal: NodeJS.Signals): void => {
+    try {
+      child.kill(signal);
+    } catch {
+      // best effort
+    }
+  };
 
   const timeoutHandle = setTimeout(() => {
     timedOut = true;
-    child.kill("SIGTERM");
+    terminate("SIGTERM");
     setTimeout(() => {
-      if (!child.killed) {
-        child.kill("SIGKILL");
-      }
+      terminate("SIGKILL");
     }, 1_500).unref();
   }, timeoutMs);
 
@@ -1107,26 +1123,107 @@ async function runCommand(
     exitCode: number | null;
     signal: NodeJS.Signals | null;
   }>((resolve) => {
-    child.on("close", (exitCode, signal) => {
+    let settled = false;
+    let sawExit = false;
+    let sawClose = false;
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
+    let settleAfterExitTimer: NodeJS.Timeout | null = null;
+    let detachAbortListener: (() => void) | null = null;
+
+    const finalize = (): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (settleAfterExitTimer) {
+        clearTimeout(settleAfterExitTimer);
+      }
+      if (detachAbortListener) {
+        detachAbortListener();
+        detachAbortListener = null;
+      }
+      child.off("exit", onExit);
+      child.off("close", onClose);
+      child.off("error", onError);
+      child.stdout?.off("data", onStdout);
+      child.stderr?.off("data", onStderr);
       resolve({
         exitCode,
-        signal,
+        signal: exitSignal,
       });
-    });
+    };
 
-    child.on("error", () => {
-      resolve({
-        exitCode: null,
-        signal: null,
-      });
-    });
+    const maybeFinalize = (): void => {
+      if (!sawExit) {
+        return;
+      }
+      if (sawClose) {
+        finalize();
+        return;
+      }
+      if (!settleAfterExitTimer) {
+        settleAfterExitTimer = setTimeout(() => {
+          finalize();
+        }, 250);
+        settleAfterExitTimer.unref();
+      }
+    };
+
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      sawExit = true;
+      exitCode = code;
+      exitSignal = signal;
+      maybeFinalize();
+    };
+
+    const onClose = (code: number | null, signal: NodeJS.Signals | null): void => {
+      sawClose = true;
+      if (!sawExit) {
+        sawExit = true;
+        exitCode = code;
+        exitSignal = signal;
+      }
+      maybeFinalize();
+    };
+
+    const onError = (): void => {
+      sawExit = true;
+      sawClose = true;
+      exitCode = null;
+      exitSignal = null;
+      maybeFinalize();
+    };
+
+    child.on("exit", onExit);
+    child.on("close", onClose);
+    child.on("error", onError);
+
+    if (options.signal) {
+      const handleAbort = (): void => {
+        aborted = true;
+        terminate("SIGTERM");
+        setTimeout(() => {
+          terminate("SIGKILL");
+        }, 1_500).unref();
+      };
+
+      if (options.signal.aborted) {
+        handleAbort();
+      } else {
+        options.signal.addEventListener("abort", handleAbort, {
+          once: true,
+        });
+        detachAbortListener = () => {
+          options.signal?.removeEventListener("abort", handleAbort);
+        };
+      }
+    }
   });
 
   clearTimeout(timeoutHandle);
 
   const durationMs = Date.now() - startedAt;
-  const ok = !timedOut && result.exitCode === 0;
-
   return {
     command,
     args,
@@ -1135,9 +1232,10 @@ async function runCommand(
     stdout,
     stderr,
     timedOut,
+    aborted,
     durationMs,
     truncatedStdout,
     truncatedStderr,
-    ok,
+    ok: !timedOut && !aborted && result.exitCode === 0,
   };
 }

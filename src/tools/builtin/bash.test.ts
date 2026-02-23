@@ -94,6 +94,26 @@ describe("bash built-in tool", () => {
     expect(output.timed_out).toBe(true);
   });
 
+  it("does not hang when command backgrounds a long-running process", async () => {
+    const first = await runBash({ command: shellEcho("detect-shell") });
+    const shell = readShellName(asRecord(first.output));
+    if (shell === "cmd" || shell === "powershell") {
+      return;
+    }
+
+    const startedAt = Date.now();
+    const result = await runBash({
+      command: shellBackgroundAndEcho(shell),
+      timeout_seconds: 15,
+    });
+    const elapsedMs = Date.now() - startedAt;
+    const output = asRecord(result.output);
+
+    expect(result.ok).toBe(true);
+    expect(readTrimmedString(output.stdout)).toContain("bg-started");
+    expect(elapsedMs).toBeLessThan(10_000);
+  });
+
   it("truncates oversized stdout", async () => {
     const first = await runBash({ command: shellEcho("detect-shell") });
     const shell = readShellName(asRecord(first.output));
@@ -304,6 +324,16 @@ function shellSleep(shell: ShellName, seconds: number): string {
     return `ping 127.0.0.1 -n ${seconds + 2} > nul`;
   }
   return `sleep ${seconds}`;
+}
+
+function shellBackgroundAndEcho(shell: ShellName): string {
+  if (shell === "powershell") {
+    return "Start-Job -ScriptBlock { Start-Sleep -Seconds 30 } | Out-Null; Write-Output bg-started";
+  }
+  if (shell === "cmd") {
+    return "start /B ping -n 30 127.0.0.1 > nul & echo bg-started";
+  }
+  return "sleep 30 & echo bg-started";
 }
 
 function shellLargeOutput(shell: ShellName): string {
